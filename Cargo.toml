@@ -1,0 +1,47 @@
+[package]
+name = "a2a-agents"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "limit"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "stream", "rustls"] }
+rmcp = { version = "=3.4.0", default-features = false, features = ["client", "auth", "reqwest", "transport-streamable-http-client-reqwest"] }
+oauth2 = { version = "5", default-features = false }
+url = { version = "2", features = ["serde"] }
+sha2 = "0.10"
+getrandom = "0.4"
+base64 = "0.22"
+aes-gcm = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+lambda_http = { version = "1", default-features = false, features = ["apigw_http"] }
+lambda_runtime = "1"
+aws_lambda_events = { version = "1", default-features = false, features = ["sqs"] }
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+aws-sdk-dynamodb = "1"
+aws-sdk-kms = "1"
+aws-sdk-sqs = "1"
+aws-sdk-bedrockruntime = "1"
+aws-smithy-types = "1"
+jsonschema = { version = "0.56", default-features = false }
+
+[dev-dependencies]
+http-body-util = "0.1"
+wiremock = "0.6"
+
+[profile.release]
+strip = true
+lto = "thin"

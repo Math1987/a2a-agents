@@ -1,0 +1,78 @@
+name: Test and deploy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a2a-agents-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Prepare Rust
+        run: rustup component add rustfmt clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Test
+        run: cargo test --locked --all-targets
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: 1.14.6
+      - name: Check Terraform
+        run: |
+          terraform fmt -check -recursive infra
+          terraform -chdir=infra/bootstrap init -backend=false -input=false
+          terraform -chdir=infra/bootstrap validate
+          terraform -chdir=infra/app init -backend=false -input=false
+          terraform -chdir=infra/app validate
+
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.DEPLOY_ENABLED == 'true'
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: eu-west-3
+      APP_NAME: a2a-agents-poc
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install Lambda build tooling
+        run: |
+          python3 -m venv .build/tools
+          .build/tools/bin/python -m pip install -r scripts/build-requirements.txt
+      - name: Build Lambda
+        run: bash scripts/build-lambda.sh
+      - uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
+        with:
+          role-to-assume: arn:aws:iam::128066560720:role/a2a-agents-poc-github-deploy
+          aws-region: eu-west-3
+      - name: Update functions
+        run: |
+          for mode in api worker; do
+            aws lambda update-function-code \
+              --function-name "${APP_NAME}-${mode}" \
+              --zip-file fileb://.build/lambda.zip \
+              --query '{FunctionName:FunctionName,LastUpdateStatus:LastUpdateStatus}'
+            aws lambda wait function-updated-v2 --function-name "${APP_NAME}-${mode}"
+          done
+      - name: Check deployed health
+        run: |
+          api_url=$(aws lambda get-function-configuration \
+            --function-name "${APP_NAME}-api" \
+            --query 'Environment.Variables.APP_PUBLIC_URL' --output text)
+          curl --fail --silent --show-error --retry 3 "${api_url}/health"

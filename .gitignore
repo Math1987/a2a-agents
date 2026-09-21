@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+/target/
+/.build/
+/.local/
+**/.terraform/
+*.tfstate*
+*.tfplan
+*.zip
+*.auto.tfvars
+__pycache__/
+.DS_Store
