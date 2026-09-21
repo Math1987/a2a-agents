@@ -108,7 +108,7 @@ curl -sS "$BASE/v1/agents/$AGENT_ID/tasks" \
   -d '{"request":"Summarize the current project and its blockers.","skill_ids":["project-summary"]}'
 ```
 
-Returns `202` and a task record. Omitted or empty `skill_ids` selects all currently configured skills. At least one valid skill is required. Reusing the same idempotency key for the same request and effective skill list returns the original task; changed content returns `409 idempotency_key_reused`. Omitting the header creates a new task every time.
+Returns `202` and a task record. For a new task, omitted or empty `skill_ids` selects all currently configured skills; at least one valid skill is required. Reusing the same idempotency key with the same request text and submitted `skill_ids` returns the original task, even after the configured skills change or are deleted. Omitted `skill_ids` and `[]` are equivalent. A changed request or explicit skill selection returns `409 idempotency_key_reused`. Omitting the header creates a new task every time.
 
 ```sh
 TASK_ID='TASK_ID'

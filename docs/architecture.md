@@ -61,7 +61,7 @@ Default execution limits are eight model turns, 2,048 output tokens per turn, 64
 
 ## Delivery and uncertainty
 
-Task creation persists before sending to SQS. A five-minute dispatch schedule retries queued records if enqueueing was interrupted. Conditional claims ensure duplicate deliveries do not start a running task again. SQS failure responses retain individual failed deliveries; expired running leases become `interrupted`, not replayed tasks.
+Task creation persists before sending to SQS. An idempotent submission stores its task and a fingerprint of the original request in one transaction. Retries check that receipt before reading current skills, so later configuration changes cannot alter the original task. A five-minute dispatch schedule retries queued records if enqueueing was interrupted. Conditional claims ensure duplicate deliveries do not start a running task again. SQS failure responses retain individual failed deliveries; expired running leases become `interrupted`, not replayed tasks.
 
 An external MCP write may succeed even when its response is lost. Tool timeouts and ambiguous connector errors stop the loop. The application does not promise exactly-once external effects and does not automatically replay an interrupted task. Idempotency keys deduplicate API task creation; provider-specific verification is still required after an uncertain write.
 
@@ -71,7 +71,7 @@ Production secrets use envelope encryption with KMS and authenticated agent/conn
 
 Outbound URLs must use public HTTPS. URL validation and the connection-time DNS resolver reject loopback, private, metadata and special-purpose destinations. Environment proxies are disabled. OAuth metadata redirects are limited to same-origin GETs; token/registration POSTs are not automatically redirected. JSON Schema references cannot fetch remote URLs or local files.
 
-Deleting an agent revokes its local access; disconnecting a connector removes locally stored credentials. Provider-side grants are not automatically revoked, and previously dispatched actions cannot be cancelled retroactively. Open creation and a model budget do not cap unrelated infrastructure traffic costs.
+Deleting an agent revokes its local access; disconnecting an OAuth connector waits for the refresh lease before disabling the connection and clearing credentials. This prevents an in-flight refresh from restoring tokens after removal. Provider-side grants are not automatically revoked, and previously dispatched actions cannot be cancelled retroactively. Open creation and a model budget do not cap unrelated infrastructure traffic costs.
 
 ## Verification and remaining integration checks
 

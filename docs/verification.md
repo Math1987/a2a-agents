@@ -2,10 +2,11 @@
 
 ## Completed before deployment
 
-- 49 Rust tests passed: 31 library tests, 12 HTTP API/contract tests and 6 DynamoDB SDK tests.
+- 54 Rust tests passed: 33 library tests, 15 HTTP API/contract tests and 6 DynamoDB SDK tests.
 - `cargo clippy --locked --all-targets -- -D warnings` and `cargo fmt --all -- --check` passed.
 - Terraform modules initialized and validated. Read-only plans show 7 bootstrap resources and 27 application resources to create; no existing resource would change or be destroyed.
 - Source staging excludes `.env`, Terraform state, build outputs and credential-shaped strings.
+- The first published revision passed GitHub Actions, including Linux Rust tests, Clippy and Terraform validation. Follow-up commits run the same checks; cloud deployment remains disabled until explicitly enabled after infrastructure approval.
 
 Tests exercise the actual Axum router and official SDKs against controlled local HTTP endpoints. They cover OAuth PKCE, state consumption and expiry, reconstruction after a process change, token rotation and refresh leases, MCP calls, Bedrock request serialization and retry behavior, DynamoDB conditional writes and pagination, agent isolation, idempotency and the global budget under concurrent reservations. Fixtures do not replace live provider authorization.
 

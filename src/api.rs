@@ -521,6 +521,18 @@ async fn disconnect(
     h: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     owner(&app, &id, &h).await?;
+    let (_, initial) = connection(&app, &id, &cid).await?;
+    let stores = app.oauth_stores(&id, &cid);
+    // Serialize with in-flight refreshes before changing the connection. A save
+    // that passed its active check must finish before we clear its credentials.
+    let _guard = if initial.auth_type == "oauth" {
+        CredentialStore::acquire_refresh_guard(&stores)
+            .await
+            .map_err(|_| conflict())?
+    } else {
+        None
+    };
+    // A refresh/callback may have updated the row while we waited for its lease.
     let (mut row, mut c) = connection(&app, &id, &cid).await?;
     c.status = "disconnected".into();
     c.secret = None;
@@ -531,7 +543,7 @@ async fn disconnect(
     if !app.store.put(row, Some(v)).await? {
         return Err(conflict());
     }
-    CredentialStore::clear(&app.oauth_stores(&id, &cid))
+    CredentialStore::clear(&stores)
         .await
         .map_err(|_| conflict())?;
     Ok(StatusCode::NO_CONTENT)
@@ -556,6 +568,28 @@ struct TaskInput {
     #[serde(default)]
     skill_ids: Vec<String>,
 }
+
+async fn previous_idempotent_task(
+    app: &App,
+    agent: &str,
+    task: &str,
+    fingerprint: &str,
+) -> Result<Option<Task>, ApiError> {
+    let pk = agent_pk(agent);
+    let Some(receipt) = app.store.get(&pk, &format!("IDEMPOTENCY#{task}")).await? else {
+        return Ok(None);
+    };
+    if receipt.payload["fingerprint"].as_str() != Some(fingerprint) {
+        return Err(ApiError(StatusCode::CONFLICT, "idempotency_key_reused"));
+    }
+    let row = app
+        .store
+        .get(&pk, &format!("TASK#{task}"))
+        .await?
+        .ok_or_else(conflict)?;
+    Ok(Some(serde_json::from_value(row.payload)?))
+}
+
 async fn create_task(
     State(app): State<App>,
     Path(id): Path<String>,
@@ -566,6 +600,24 @@ async fn create_task(
     if input.request.trim().is_empty() || input.request.len() > 32000 {
         return Err(invalid());
     }
+    let (tid, fingerprint) = if let Some(key) = h.get("idempotency-key") {
+        let key = key.to_str().map_err(|_| invalid())?;
+        if key.len() > 200 || key.is_empty() {
+            return Err(invalid());
+        }
+        let tid = digest(&format!("{id}:{key}"));
+        // Bind idempotency to what the caller submitted, before resolving the
+        // mutable skill configuration. Omitted skill_ids and [] are equivalent.
+        let fingerprint = digest(&serde_json::to_string(&json!({
+            "request":input.request,"skill_ids":input.skill_ids
+        }))?);
+        if let Some(old) = previous_idempotent_task(&app, &id, &tid, &fingerprint).await? {
+            return Ok((StatusCode::ACCEPTED, Json(json!(old))));
+        }
+        (tid, Some(fingerprint))
+    } else {
+        (uuid::Uuid::new_v4().to_string(), None)
+    };
     let available = skills(&app, &id).await?;
     if input.skill_ids.is_empty() {
         input.skill_ids = available.iter().map(|s| s.id.clone()).collect();
@@ -578,15 +630,6 @@ async fn create_task(
     {
         return Err(ApiError(StatusCode::BAD_REQUEST, "configure_a_skill_first"));
     }
-    let tid = if let Some(key) = h.get("idempotency-key") {
-        let key = key.to_str().map_err(|_| invalid())?;
-        if key.len() > 200 || key.is_empty() {
-            return Err(invalid());
-        }
-        digest(&format!("{id}:{key}"))
-    } else {
-        uuid::Uuid::new_v4().to_string()
-    };
     let task = Task {
         id: tid.clone(),
         agent_id: id.clone(),
@@ -605,17 +648,25 @@ async fn create_task(
         serde_json::to_value(&task)?,
     );
     row.due = Some(("TASK".into(), now()));
-    if !app.store.put(row, None).await? {
-        let old = app
-            .store
-            .get(&agent_pk(&id), &format!("TASK#{tid}"))
+    let created = if let Some(fingerprint) = &fingerprint {
+        let receipt = Row::new(
+            agent_pk(&id),
+            format!("IDEMPOTENCY#{tid}"),
+            json!({"fingerprint":fingerprint}),
+        );
+        app.store
+            .transaction(vec![(row, None), (receipt, None)])
             .await?
-            .ok_or_else(conflict)?;
-        let old: Task = serde_json::from_value(old.payload)?;
-        if old.request != task.request || old.skill_ids != task.skill_ids {
-            return Err(ApiError(StatusCode::CONFLICT, "idempotency_key_reused"));
+    } else {
+        app.store.put(row, None).await?
+    };
+    if !created {
+        if let Some(fingerprint) = &fingerprint
+            && let Some(old) = previous_idempotent_task(&app, &id, &tid, fingerprint).await?
+        {
+            return Ok((StatusCode::ACCEPTED, Json(json!(old))));
         }
-        return Ok((StatusCode::ACCEPTED, Json(json!(old))));
+        return Err(conflict());
     }
     if app.enqueue(&id, &tid).await.is_err() {
         tracing::warn!(event = "task_enqueue_deferred");

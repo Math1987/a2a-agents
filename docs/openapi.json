@@ -1594,7 +1594,7 @@
           "minLength": 1,
           "maxLength": 200
         },
-        "description": "Same agent, key, request and effective skill list return the original task; changed content gives 409."
+        "description": "Same agent, key, request text and submitted skill_ids return the original task even after skills change or are deleted. Omitted skill_ids and [] are equivalent. A different submitted request returns 409."
       }
     },
     "responses": {

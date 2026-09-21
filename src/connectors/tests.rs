@@ -406,3 +406,88 @@ async fn changed_issuer_is_rejected_before_sending_credentials() {
     assert!(matches!(error, ConnectorError::IssuerChanged));
     assert_eq!(fixture.provider.refresh_count.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn maintenance_keeps_valid_access_tokens_without_refresh_tokens_connectable() {
+    let fixture = fixture().await;
+    let http = OutboundHttp::for_local_tests();
+    let service = OAuthService::new(http.clone());
+    let config = OAuthConfiguration {
+        mcp_url: format!("{}/mcp", fixture.provider.base),
+        client_id: "test-client".into(),
+        client_secret: Some("test-secret".into()),
+        redirect_uri: format!("{}/callback", fixture.provider.base),
+        scopes: vec!["mcp".into()],
+        issuer: Some(fixture.provider.base.clone()),
+    };
+    let received_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for lifetime in [None, Some(30 * 86400)] {
+        let credentials = DurableCredentials::default();
+        let mut token = json!({"access_token":"refreshed-access","token_type":"Bearer"});
+        if let Some(seconds) = lifetime {
+            token["expires_in"] = json!(seconds);
+        }
+        credentials
+            .save(
+                StoredCredentials::new(
+                    "test-client".into(),
+                    Some(serde_json::from_value(token).unwrap()),
+                    vec!["mcp".into()],
+                    Some(received_at),
+                )
+                .with_issuer(Some(fixture.provider.base.clone())),
+            )
+            .await
+            .unwrap();
+        let before = credentials.bytes.lock().await.clone();
+        service.refresh(&config, credentials.clone()).await.unwrap();
+        assert_eq!(*credentials.bytes.lock().await, before);
+        let manager = service
+            .manager(&config, DurableStates::default(), credentials)
+            .await
+            .unwrap();
+        let session = McpSession::connect_oauth(&http, &config.mcp_url, manager)
+            .await
+            .unwrap();
+        assert_eq!(session.tools().await.unwrap()[0].name, "echo");
+        session.close().await.unwrap();
+    }
+    assert_eq!(fixture.provider.refresh_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn maintenance_requires_reauthorization_for_expired_access_without_refresh_token() {
+    let fixture = fixture().await;
+    let service = OAuthService::new(OutboundHttp::for_local_tests());
+    let config = OAuthConfiguration {
+        mcp_url: format!("{}/mcp", fixture.provider.base),
+        client_id: "test-client".into(),
+        client_secret: Some("test-secret".into()),
+        redirect_uri: format!("{}/callback", fixture.provider.base),
+        scopes: vec!["mcp".into()],
+        issuer: Some(fixture.provider.base.clone()),
+    };
+    let credentials = DurableCredentials::default();
+    credentials
+        .save(
+            StoredCredentials::new(
+                "test-client".into(),
+                Some(
+                    serde_json::from_value(json!({"access_token":"expired-access",
+            "token_type":"Bearer","expires_in":3600}))
+                    .unwrap(),
+                ),
+                vec!["mcp".into()],
+                Some(1),
+            )
+            .with_issuer(Some(fixture.provider.base.clone())),
+        )
+        .await
+        .unwrap();
+    let error = service.refresh(&config, credentials).await.unwrap_err();
+    assert!(error.requires_authorization());
+    assert_eq!(fixture.provider.refresh_count.load(Ordering::SeqCst), 0);
+}

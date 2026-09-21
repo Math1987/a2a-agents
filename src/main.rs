@@ -6,7 +6,7 @@ async fn main() -> anyhow::Result<()> {
     // OAuth SDK debug logs may contain credentials. Keep this filter fixed.
     tracing_subscriber::fmt()
         .json()
-        .with_env_filter("a2a_agents=info,rmcp=warn,aws_smithy_runtime=warn")
+        .with_env_filter("off,a2a_agents=info")
         .init();
     let mode = std::env::var("APP_MODE").unwrap_or_else(|_| "local".into());
     let app = if mode == "local" {

@@ -250,17 +250,20 @@ impl Store for DynamoStore {
         let mut rows = Vec::new();
         let mut cursor = None;
         loop {
-            let out = self
+            let mut request = self
                 .client
                 .query()
                 .table_name(&self.table)
-                .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+                .key_condition_expression("pk = :pk")
                 .expression_attribute_values(":pk", Av::S(pk.into()))
-                .expression_attribute_values(":prefix", Av::S(prefix.into()))
                 .consistent_read(true)
-                .set_exclusive_start_key(cursor)
-                .send()
-                .await?;
+                .set_exclusive_start_key(cursor);
+            if !prefix.is_empty() {
+                request = request
+                    .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+                    .expression_attribute_values(":prefix", Av::S(prefix.into()));
+            }
+            let out = request.send().await?;
             for item in out.items.unwrap_or_default() {
                 rows.push(Self::decode(item)?)
             }

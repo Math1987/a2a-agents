@@ -784,3 +784,236 @@ async fn live_route_responses_match_the_published_openapi_contract() {
     matches_openapi_schema("Task", &response.json);
     assert_eq!(response.json["result"]["text"], "Project is on track.");
 }
+
+#[tokio::test]
+async fn idempotent_replay_survives_deleting_the_original_explicit_skill() {
+    let client = Client::new().await;
+    let (agent, key) = client.agent("Stable request receipt").await;
+    assert_eq!(
+        client.skill(&agent, &key, "planning").await.status,
+        StatusCode::OK
+    );
+    let path = format!("/v1/agents/{agent}/tasks");
+    let body = json!({"request":"Find a slot", "skill_ids":["planning"]});
+    let original = client
+        .call_with_idempotency(
+            Method::POST,
+            &path,
+            Some(&key),
+            Some(body.clone()),
+            Some("stable"),
+        )
+        .await;
+    assert_eq!(original.status, StatusCode::ACCEPTED);
+    assert_eq!(
+        client
+            .call(
+                Method::DELETE,
+                &format!("/v1/agents/{agent}/skills/planning"),
+                Some(&key),
+                None
+            )
+            .await
+            .status,
+        StatusCode::NO_CONTENT
+    );
+    let replay = client
+        .call_with_idempotency(Method::POST, &path, Some(&key), Some(body), Some("stable"))
+        .await;
+    assert_eq!(replay.status, StatusCode::ACCEPTED);
+    assert_eq!(replay.json, original.json);
+    let changed = client
+        .call_with_idempotency(
+            Method::POST,
+            &path,
+            Some(&key),
+            Some(json!({"request":"Find two slots", "skill_ids":["planning"]})),
+            Some("stable"),
+        )
+        .await;
+    assert_eq!(changed.status, StatusCode::CONFLICT);
+    assert_eq!(changed.json["error"], "idempotency_key_reused");
+    assert_eq!(
+        client
+            .app
+            .store
+            .list(&agent_pk(&agent), "TASK#")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        client
+            .app
+            .store
+            .list(&agent_pk(&agent), "IDEMPOTENCY#")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn omitted_skill_selection_replays_the_original_task_after_configuration_changes() {
+    let client = Client::new().await;
+    let (agent, key) = client.agent("Default selection receipt").await;
+    assert_eq!(
+        client.skill(&agent, &key, "first").await.status,
+        StatusCode::OK
+    );
+    let path = format!("/v1/agents/{agent}/tasks");
+    let original = client
+        .call_with_idempotency(
+            Method::POST,
+            &path,
+            Some(&key),
+            Some(json!({"request":"Summarize"})),
+            Some("default-selection"),
+        )
+        .await;
+    assert_eq!(original.status, StatusCode::ACCEPTED);
+    assert_eq!(
+        client.skill(&agent, &key, "second").await.status,
+        StatusCode::OK
+    );
+    let replay = client
+        .call_with_idempotency(
+            Method::POST,
+            &path,
+            Some(&key),
+            Some(json!({"request":"Summarize", "skill_ids":[]})),
+            Some("default-selection"),
+        )
+        .await;
+    assert_eq!(replay.status, StatusCode::ACCEPTED);
+    assert_eq!(replay.json["id"], original.json["id"]);
+    assert_eq!(replay.json["skill_ids"], json!(["first"]));
+    // An explicit selection is a different original request, even if it happens
+    // to match the first task's resolved list.
+    let changed = client
+        .call_with_idempotency(
+            Method::POST,
+            &path,
+            Some(&key),
+            Some(json!({"request":"Summarize", "skill_ids":["first"]})),
+            Some("default-selection"),
+        )
+        .await;
+    assert_eq!(changed.status, StatusCode::CONFLICT);
+    for skill in ["first", "second"] {
+        assert_eq!(
+            client
+                .call(
+                    Method::DELETE,
+                    &format!("/v1/agents/{agent}/skills/{skill}"),
+                    Some(&key),
+                    None
+                )
+                .await
+                .status,
+            StatusCode::NO_CONTENT
+        );
+    }
+    let replay = client
+        .call_with_idempotency(
+            Method::POST,
+            &path,
+            Some(&key),
+            Some(json!({"request":"Summarize"})),
+            Some("default-selection"),
+        )
+        .await;
+    assert_eq!(replay.status, StatusCode::ACCEPTED);
+    assert_eq!(replay.json, original.json);
+}
+
+#[tokio::test]
+async fn oauth_disconnect_waits_for_inflight_refresh_before_clearing_rotated_tokens() {
+    use rmcp::transport::auth::{CredentialStore, StoredCredentials};
+    use std::time::Duration;
+
+    let client = Client::new().await;
+    let (agent, key) = client.agent("Refresh versus disconnect").await;
+    let response = client
+        .call(
+            Method::POST,
+            &format!("/v1/agents/{agent}/connectors"),
+            Some(&key),
+            Some(json!({
+                "name":"OAuth fixture", "url":"https://example.com/mcp", "auth_type":"oauth"
+            })),
+        )
+        .await;
+    assert_eq!(response.status, StatusCode::CREATED);
+    let connection = response.json["id"].as_str().unwrap();
+    let mut row = client
+        .app
+        .store
+        .get(&agent_pk(&agent), &format!("CONN#{connection}"))
+        .await
+        .unwrap()
+        .unwrap();
+    let version = row.version;
+    row.payload["status"] = json!("connected");
+    assert!(client.app.store.put(row, Some(version)).await.unwrap());
+    let credentials = |token: &str| {
+        StoredCredentials::new(
+        "fixture-client".into(),
+        Some(serde_json::from_value(json!({"access_token":token,"refresh_token":"rotating-refresh","token_type":"Bearer","expires_in":3600})).unwrap()),
+        vec![],
+        Some(a2a_agents::domain::now() as u64),
+    )
+    };
+    let stores = client.app.oauth_stores(&agent, connection);
+    stores.save(credentials("initial")).await.unwrap();
+    let guard = stores.acquire_refresh_guard().await.unwrap();
+
+    // Hold the same durable lease a real SDK refresh owns while its provider
+    // request is in flight, then route DELETE through the actual API.
+    let router = client.router.clone();
+    let request = Request::builder()
+        .method(Method::DELETE)
+        .uri(format!("/v1/agents/{agent}/connectors/{connection}"))
+        .header("authorization", format!("Bearer {key}"))
+        .body(Body::empty())
+        .unwrap();
+    let mut deleting = tokio::spawn(async move { router.oneshot(request).await.unwrap() });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut deleting)
+            .await
+            .is_err(),
+        "disconnect completed before the in-flight credential save"
+    );
+    let mut row = client
+        .app
+        .store
+        .get(&agent_pk(&agent), &format!("CONN#{connection}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.payload["status"], "connected");
+    // Maintenance may update this row while DELETE is waiting. The endpoint
+    // must reload the new version after acquiring the lease.
+    let version = row.version;
+    row.payload["next_maintenance"] = json!(a2a_agents::domain::now() + 7 * 86400);
+    assert!(client.app.store.put(row, Some(version)).await.unwrap());
+
+    stores.save(credentials("rotated")).await.unwrap();
+    drop(guard);
+    let response = tokio::time::timeout(Duration::from_secs(2), deleting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let persisted = client
+        .app
+        .store
+        .get(&agent_pk(&agent), &format!("CREDENTIALS#{connection}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(persisted.payload.get("sealed").is_none());
+    assert!(stores.save(credentials("must-not-reappear")).await.is_err());
+}

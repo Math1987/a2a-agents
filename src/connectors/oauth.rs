@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use oauth2::TokenResponse;
 use rmcp::transport::auth::{
     AuthorizationManager, CredentialStore, InMemoryStateStore, OAuthClientConfig, StateStore,
 };
@@ -173,10 +174,23 @@ impl OAuthService {
     where
         C: CredentialStore + 'static,
     {
-        self.manager(config, InMemoryStateStore::new(), credentials)
+        let renewable = credentials
+            .load()
             .await?
-            .refresh_token()
+            .and_then(|stored| stored.token_response)
+            .is_some_and(|token| token.refresh_token().is_some());
+        let manager = self
+            .manager(config, InMemoryStateStore::new(), credentials)
             .await?;
+        if renewable {
+            // Keep renewable grants active even when the agent is idle.
+            manager.refresh_token().await?;
+        } else {
+            // Some providers issue long-lived access tokens without a refresh
+            // token. Their absence is not an expired authorization: retain the
+            // access token for its advertised lifetime (possibly unbounded).
+            manager.get_access_token().await?;
+        }
         Ok(())
     }
 
