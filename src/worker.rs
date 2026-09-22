@@ -92,8 +92,65 @@ impl ToolExecutor for &Executor {
             content: serde_json::to_value(response).map_err(|_| denied())?,
         })
     }
+
+    async fn refresh_tools(
+        &self,
+        connector_id: &str,
+    ) -> Result<Option<Vec<AvailableTool>>, ToolExecutionError> {
+        let unavailable = || ToolExecutionError {
+            message: "connector tools could not be refreshed".into(),
+            outcome_unknown: false,
+        };
+        self.authorized_connection(connector_id).await?;
+        let session = self.sessions.get(connector_id).ok_or_else(unavailable)?;
+        let exposed = session.tools().await.map_err(|_| unavailable())?;
+        // Permissions may change while tools/list is in flight. Rediscovery
+        // cannot grant access: apply the latest exact allowlist after it returns.
+        let connection = self.authorized_connection(connector_id).await?;
+        Ok(Some(
+            exposed
+                .into_iter()
+                .filter(|tool| {
+                    connection
+                        .allowed_tools
+                        .iter()
+                        .any(|allowed| allowed == "*" || allowed == tool.name.as_ref())
+                })
+                .map(|tool| AvailableTool {
+                    connector_id: connector_id.to_owned(),
+                    name: tool.name.to_string(),
+                    description: tool
+                        .description
+                        .as_ref()
+                        .map(|text| text.to_string())
+                        .unwrap_or_default(),
+                    input_schema: json!(tool.input_schema),
+                })
+                .collect(),
+        ))
+    }
 }
 impl Executor {
+    async fn authorized_connection(
+        &self,
+        connector_id: &str,
+    ) -> Result<Connection, ToolExecutionError> {
+        let denied = || ToolExecutionError {
+            message: "connector is no longer authorized".into(),
+            outcome_unknown: false,
+        };
+        crate::api::agent(&self.app, &self.agent)
+            .await
+            .map_err(|_| denied())?;
+        let (_, connection) = crate::api::connection(&self.app, &self.agent, connector_id)
+            .await
+            .map_err(|_| denied())?;
+        if connection.status != "connected" {
+            return Err(denied());
+        }
+        Ok(connection)
+    }
+
     async fn close(self) {
         let mut pending = tokio::task::JoinSet::new();
         for (_, session) in self.sessions {
@@ -165,7 +222,10 @@ pub async fn run_task(app: App, agent_id: &str, task_id: &str) -> anyhow::Result
             current.result = Some(output);
         }
         Ok(Err(error)) => {
-            current.status = if matches!(error, EngineError::ToolOutcomeUnknown { .. }) {
+            current.status = if matches!(
+                error,
+                EngineError::ToolOutcomeUnknown { .. } | EngineError::ToolRefreshFailed { .. }
+            ) {
                 "interrupted"
             } else {
                 "failed"
@@ -178,6 +238,9 @@ pub async fn run_task(app: App, agent_id: &str, task_id: &str) -> anyhow::Result
                     }
                     EngineError::ToolOutcomeUnknown { .. } => {
                         "tool_outcome_unknown_do_not_retry_blindly"
+                    }
+                    EngineError::ToolRefreshFailed { .. } => {
+                        "tool_refresh_failed_after_execution_do_not_retry_blindly"
                     }
                     EngineError::InvalidInput(_) => "skill_or_connector_unavailable",
                     _ => "execution_failed",
@@ -266,30 +329,13 @@ async fn execute_with_sessions(
             }
         };
         executor.sessions.insert(id.clone(), session);
-        for t in executor
-            .sessions
-            .get(&id)
-            .ok_or_else(bad)?
-            .tools()
-            .await
-            .map_err(|_| bad())?
-        {
-            if c.allowed_tools
-                .iter()
-                .any(|a| a == "*" || a == t.name.as_ref())
-            {
-                tools.push(AvailableTool {
-                    connector_id: id.clone(),
-                    name: t.name.to_string(),
-                    description: t
-                        .description
-                        .as_ref()
-                        .map(|s| s.to_string())
-                        .unwrap_or_default(),
-                    input_schema: json!(t.input_schema),
-                });
-            }
-        }
+        tools.extend(
+            (&*executor)
+                .refresh_tools(&id)
+                .await
+                .map_err(|_| bad())?
+                .ok_or_else(bad)?,
+        );
     }
     let config = app.aws.as_ref().ok_or_else(bad)?;
     let model = BedrockModel::new(config, app.model_id.clone(), app.count_model_id.clone());
@@ -879,6 +925,169 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(credentials.payload["sealed"], "new");
+    }
+
+    async fn dynamic_executor(allow_run: bool) -> (Executor, wiremock::MockServer) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate, matchers::method};
+        let server = MockServer::start().await;
+        let configured = Arc::new(AtomicBool::new(false));
+        Mock::given(method("POST")).respond_with(move |request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let method = body["method"].as_str().unwrap();
+            if method != "initialize" {
+                assert_eq!(request.headers["mcp-session-id"], "worker-test-session");
+            }
+            let result = match method {
+                "initialize" => json!({"protocolVersion":body["params"]["protocolVersion"],
+                    "capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}),
+                "notifications/initialized" => return ResponseTemplate::new(202),
+                "tools/list" => json!({"tools":[{
+                    "name": if configured.load(Ordering::SeqCst) {"run_calendar-create"} else {"calendar-create"},
+                    "inputSchema":{"type":"object"}}]}),
+                "tools/call" => {
+                    assert_eq!(body["params"]["name"], "calendar-create");
+                    configured.store(true, Ordering::SeqCst);
+                    json!({"content":[{"type":"text","text":"Run tool now available"}],"isError":false})
+                }
+                _ => panic!("unexpected fixture method {method}"),
+            };
+            ResponseTemplate::new(200)
+                .insert_header("mcp-session-id", "worker-test-session")
+                .set_body_json(json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+        }).mount(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(405))
+            .mount(&server)
+            .await;
+        let mut app = fixture().await;
+        app.http = crate::connectors::OutboundHttp::for_local_tests();
+        let mut connection = add_connection(&app, "connection").await;
+        connection.url = server.uri();
+        connection.auth_type = "none".into();
+        connection.allowed_tools = vec!["calendar-create".into()];
+        if allow_run {
+            connection.allowed_tools.push("run_calendar-create".into());
+        }
+        app.store
+            .put(
+                Row::new(agent_pk("agent"), "CONN#connection", json!(connection)),
+                Some(1),
+            )
+            .await
+            .unwrap();
+        let session = connect(&app, &connection).await.unwrap();
+        (
+            Executor {
+                app,
+                agent: "agent".into(),
+                sessions: BTreeMap::from([("connection".into(), session)]),
+            },
+            server,
+        )
+    }
+
+    #[tokio::test]
+    async fn refresh_dynamic_catalog_requires_exact_allowlist_on_the_same_session() {
+        for allow_run in [false, true] {
+            let (executor, server) = dynamic_executor(allow_run).await;
+            let initial = (&executor)
+                .refresh_tools("connection")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(initial.len(), 1);
+            assert_eq!(initial[0].name, "calendar-create");
+            (&executor)
+                .execute("connection", "calendar-create", json!({}))
+                .await
+                .unwrap();
+            let dynamic = (&executor)
+                .refresh_tools("connection")
+                .await
+                .unwrap()
+                .unwrap();
+            if allow_run {
+                assert_eq!(dynamic.len(), 1);
+                assert_eq!(dynamic[0].name, "run_calendar-create");
+            } else {
+                assert!(dynamic.is_empty());
+                let denied = (&executor)
+                    .execute("connection", "run_calendar-create", json!({}))
+                    .await
+                    .unwrap_err();
+                assert!(!denied.outcome_unknown);
+            }
+            let methods: Vec<_> = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.method == "POST")
+                .map(|request| {
+                    serde_json::from_slice::<Value>(&request.body).unwrap()["method"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect();
+            assert_eq!(
+                methods,
+                [
+                    "initialize",
+                    "notifications/initialized",
+                    "tools/list",
+                    "tools/call",
+                    "tools/list"
+                ]
+            );
+            executor.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_catalog_rejects_disconnected_connector_and_deleted_agent() {
+        let (executor, server) = dynamic_executor(true).await;
+        for status in ["disconnected", "connected"] {
+            let mut row = executor
+                .app
+                .store
+                .get(&agent_pk("agent"), "CONN#connection")
+                .await
+                .unwrap()
+                .unwrap();
+            let version = row.version;
+            row.payload["status"] = json!(status);
+            executor.app.store.put(row, Some(version)).await.unwrap();
+            if status == "connected" {
+                delete_agent(&executor.app).await;
+            }
+            let before = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.method == "POST")
+                .count();
+            let denied = (&executor).refresh_tools("connection").await.unwrap_err();
+            assert!(!denied.outcome_unknown);
+            assert_eq!(denied.message, "connector is no longer authorized");
+            let after = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.method == "POST")
+                .count();
+            assert_eq!(
+                before, after,
+                "revocation must block tools/list before network I/O"
+            );
+        }
+        executor.close().await;
     }
 
     #[tokio::test]

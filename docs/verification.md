@@ -34,6 +34,18 @@ A separate disposable bearer connector proved KMS data-key generation, encrypted
 
 The read-only [deployment checker](../scripts/DEPLOYMENT-CHECKS.md) passed: the durable September ledger recorded 4,318 micro-USD against a 25,000,000 micro-USD cap; runtime configuration, KMS, schedules and task queues were correct. Both the task queue and dead-letter queue were empty.
 
-## Provider authorization still required
+## Owner-guided Google Calendar check
+
+The account owner manually created an agent, authorized Pipedream MCP at `https://mcp.pipedream.net/v2` with `mcp` and `offline_access`, and confirmed its connected status. Tool discovery and model-driven calendar listing succeeded. A controlled availability check also matched an event entered by the owner: one half-hour interval was busy and the immediately following interval was free, with the correct UTC conversion.
+
+Free-form slot suggestions initially contained incorrect weekdays and a timezone conversion. Refining the skill improved the response, but did not establish reliable date calculation: a later answer still omitted the requested raw time field and expanded the requested date range. These are remaining output-quality limitations, separate from connector access.
+
+An event-creation attempt returned a final response reporting uncertainty. Pipedream's response referenced a dynamically exposed `run_…` tool, whereas the worker had only discovered tools at task startup. This is not a successful creation check, even though the task status was `completed`. The runtime now refreshes tool discovery within the existing session after each call. Regression tests cover the configuration-to-execution transition; a real provider creation still needs a new owner-guided test after checking that the first attempt did not create an event.
+
+The dynamic-discovery correction passes **62 Rust tests**: 41 library tests, 15 API tests and 6 DynamoDB SDK tests. A local Streamable HTTP server exercises the actual MCP SDK's session preservation and changing tool schemas. Worker tests enforce exact allowlists and revocation; engine tests cover new execution tools, stale batch calls, invalid discovery, timeouts and removal of every tool. Bedrock SDK HTTP tests verify that token counting and inference receive the same history even after every tool is removed.
+
+No personal calendar identifiers, owner keys or OAuth credentials are included in this report. The original task is not automatically replayed.
+
+## Remaining provider checks
 
 A real authenticated connector needs its account owner's consent. For each chosen provider, verify authorization, tool discovery, an allowed read and refresh after the original access token expires. Multi-month grant validity remains subject to provider expiry, revocation and policy; it cannot be established by this short test run.

@@ -53,6 +53,8 @@ Lambda does not stay alive between tasks. OAuth grants are persisted data, indep
 
 The worker claims each queued task conditionally, loads its selected Markdown skills, connects their associated MCP servers and exposes only permitted tools to Bedrock. Tool aliases bind the connector and original tool name. The model chooses calls; the backend validates arguments and rechecks connection permissions before execution. Connector credentials are injected by the transport and never included in the model request.
 
+Tool discovery is refreshed on the same MCP session after each completed tool call, including tool-reported errors. Some servers expose configuration tools first, then reveal an execution tool or a different input schema. The refreshed list replaces that connector's previous tools; other connectors are unaffected. Every replacement is subject to the same schema validation, tool-count limits and current owner allowlist. A newly named execution tool is not implicitly authorized by permission for its configuration tool. If discovery fails after a call, the task is interrupted rather than continuing with stale tools or replaying an action.
+
 The model is configured with the EU inference profile for Claude Haiku 4.5. Token counting uses the corresponding base model ID because the inference-profile ID does not support CountTokens. Prices are configuration: the initial conservative EU rates are 1,100,000 and 5,500,000 micro-USD per million input/output tokens. Update prices and counting configuration together when changing models.
 
 Before each paid call, CountTokens counts the complete request, including tool schemas and results. An atomic DynamoDB transaction reserves input cost plus maximum output cost against **25,000,000 micro-USD per UTC month**. Known usage settles that reservation in its original month. Ambiguous responses retain it. Automatic retries of paid Converse requests are disabled. This bounds model spending at configured prices; infrastructure and connector charges are separate.
@@ -64,6 +66,8 @@ Default execution limits are eight model turns, 2,048 output tokens per turn, 64
 Task creation persists before sending to SQS. An idempotent submission stores its task and a fingerprint of the original request in one transaction. Retries check that receipt before reading current skills, so later configuration changes cannot alter the original task. A five-minute dispatch schedule retries queued records if enqueueing was interrupted. Conditional claims ensure duplicate deliveries do not start a running task again. SQS failure responses retain individual failed deliveries; expired running leases become `interrupted`, not replayed tasks.
 
 An external MCP write may succeed even when its response is lost. Tool timeouts and ambiguous connector errors stop the loop. The application does not promise exactly-once external effects and does not automatically replay an interrupted task. Idempotency keys deduplicate API task creation; provider-specific verification is still required after an uncertain write.
+
+`completed` means the model/tool loop produced a final response. It does not certify that the requested external action succeeded: the final response may report an unavailable tool, a conflict, or an uncertain result. Verify the provider's returned object and, for a creation smoke test, its presence in the provider UI before counting that action as successful.
 
 ## Secret and network boundaries
 

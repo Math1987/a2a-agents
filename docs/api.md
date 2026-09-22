@@ -50,7 +50,7 @@ curl -sS "$BASE/v1/agents/$AGENT_ID/connectors/$CONNECTOR_ID/authorize" \
 The service discovers OAuth metadata and attempts dynamic client registration when no client ID is supplied. Open the returned `authorization_url` in your browser and approve access. For a provider requiring prior registration, pass `{"client_id":"CLIENT_ID","client_secret":"CLIENT_SECRET","scopes":["PROVIDER_SCOPE"]}` instead. `client_secret` and `scopes` are optional. Register this exact callback when required:
 
 ```text
-https://YOUR_API_ID.execute-api.eu-west-3.amazonaws.com/oauth/callback/AGENT_ID/CONNECTOR_ID
+https://agents.aithos.app/oauth/callback/AGENT_ID/CONNECTOR_ID
 ```
 
 The provider redirects the browser there with `code` and `state`, and optionally `iss`. The callback validates the pending state and PKCE flow, exchanges the code and stores tokens. You do not manually submit the owner key to this callback. A successful response reports `status: connected`.
@@ -67,6 +67,8 @@ curl -sS "$BASE/v1/agents/$AGENT_ID/connectors/$CONNECTOR_ID/tools" -H "Authoriz
 ```
 
 The tools request connects to the remote server and returns its MCP tool definitions. Connection states are `authorization_required`, `authorization_pending`, `connected`, and `reauthorization_required`; disconnected entries disappear from listings. Repeat `/authorize` to reconnect using the durable registration parameters.
+
+Tool definitions can change during a task. The worker refreshes discovery on the existing MCP session after each completed tool call, so configuration and execution tools exposed in successive steps can be used by the same task. This API discovery request uses its own session and does not expose another task's temporary configuration state. Exact `allowed_tools` names apply to dynamically exposed tools too; permission for a configuration tool does not automatically permit an execution tool with another name.
 
 ## Alternative: a connector accepting a bearer token
 
@@ -126,6 +128,8 @@ curl -sS "$BASE/v1/agents/$AGENT_ID/tasks/$TASK_ID" -H "Authorization: Bearer $O
 Queued delivery can be retried; an already running task is never blindly executed again. Before resubmitting an interrupted task under a new idempotency key, check the external system. Neither task idempotency nor SQS deduplication can guarantee exactly-once writes to arbitrary MCP tools.
 
 For completed tasks, `result.usage` contains aggregate `input_tokens` and `output_tokens`. Costs are integer micro-USD: `1_000_000` means 1 USD. `result` is `null` until completion.
+
+`completed` confirms that the agent returned a final response, not that every requested external action succeeded. Read `result.text` and verify any created object with its provider. A failure to refresh MCP tools after an operation marks the task `interrupted`; check external state before submitting a new task because the preceding operation may already have succeeded.
 
 ## Cleanup and routes
 
