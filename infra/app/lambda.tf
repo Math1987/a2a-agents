@@ -28,7 +28,7 @@ resource "aws_lambda_function" "app" {
       APP_TABLE                              = aws_dynamodb_table.app.name
       APP_QUEUE_URL                          = aws_sqs_queue.tasks.url
       APP_KMS_KEY_ID                         = aws_kms_key.secrets.arn
-      APP_PUBLIC_URL                         = aws_apigatewayv2_api.api.api_endpoint
+      APP_PUBLIC_URL                         = local.public_url
       APP_MODEL_ID                           = var.model_id
       APP_COUNT_MODEL_ID                     = var.foundation_model_id
       APP_MONTHLY_BUDGET_MICRO_USD           = tostring(var.monthly_budget_micro_usd)

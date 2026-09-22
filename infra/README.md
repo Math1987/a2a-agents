@@ -5,6 +5,7 @@ The isolated `a2a-agents-poc` stack uses account `128066560720`, region `eu-west
 ## Resources and cost
 
 - Two Rust Lambda functions (`api`, `worker`), HTTP API Gateway, no VPC or NAT.
+- Regional API Gateway custom domain `agents.aithos.app`, an ACM public certificate in Paris, and DNS records in the existing public `aithos.app` zone.
 - One on-demand DynamoDB table, one task queue plus a dead-letter queue, managed encryption at rest.
 - One customer-managed KMS key for connector credential encryption (a standing key charge, plus request charges).
 - CloudWatch logs retained 14 days; access logs omit URLs, query strings, headers, and bodies.
@@ -22,10 +23,14 @@ Authenticate locally with the intended AWS profile. Do not copy credentials into
 2. Run `terraform -chdir=infra/bootstrap plan -out=bootstrap.tfplan`, inspect the plan, then `terraform -chdir=infra/bootstrap apply bootstrap.tfplan`. The GitHub provider already exists in this AWS account. The exact immutable subject configured for this repository is `repo:Math1987@55652304/a2a-agents@1379233470:ref:refs/heads/main`. Do not replace it with a wildcard.
 3. The bootstrap starts with local state because its bucket does not exist yet. Immediately back up that state securely. Once the bucket exists, add an ignored `infra/bootstrap/backend.generated.tf` containing a `terraform { backend "s3" {} }` block and run `terraform -chdir=infra/bootstrap init -migrate-state -backend-config='bucket=aithos-a2a-agents-tfstate-128066560720-eu-west-3' -backend-config='key=bootstrap/terraform.tfstate' -backend-config='region=eu-west-3' -backend-config='encrypt=true' -backend-config='use_lockfile=true'` to persist it remotely.
 4. Run `terraform -chdir=infra/app init -backend-config=backend.hcl.example`. Native S3 lockfiles prevent concurrent Terraform writes.
-5. Run `terraform -chdir=infra/app plan -out=app.tfplan`, inspect the plan, then `terraform -chdir=infra/app apply app.tfplan`.
+5. Confirm the existing public `aithos.app` Route 53 zone is delegated from the domain registrar, and that `agents.aithos.app` has no conflicting DNS record or API Gateway custom domain. Run `terraform -chdir=infra/app plan -out=app.tfplan`, inspect the plan, then `terraform -chdir=infra/app apply app.tfplan`. Terraform creates the ACM validation CNAME and waits for certificate issuance before creating the custom domain. DNS validation can take several minutes.
 6. Read the URL with `terraform -chdir=infra/app output -raw api_url`; test its `/health` route and the complete API flow.
 
-The API's execute-api endpoint is the stable `APP_PUBLIC_URL` and OAuth callback origin. Keep the API resource when making updates. For a custom domain later, update provider OAuth registrations and the application URL together.
+The canonical API URL and `APP_PUBLIC_URL` are **`https://agents.aithos.app`**, also used for Agent Cards and OAuth callback URLs. A regional API Gateway custom domain maps its root path to the `$default` stage. ACM uses the same AWS region as the API (`eu-west-3`), and a Route 53 A alias routes the hostname to that regional domain. The underlying execute-api endpoint remains available as the `execute_api_url` diagnostic output; register OAuth callbacks with the canonical hostname.
+
+`dns_zone_name` and `api_domain_name` default to the names above. The data source looks up the exact existing **public** zone and does not create or modify the zone itself. DNS record creation uses `allow_overwrite = false`, including the ACM validation CNAME: an existing unmanaged record causes an error instead of being silently overwritten. If a matching record already exists, inspect its ownership and import it explicitly only when appropriate. Leave the ACM validation CNAME in place for automatic certificate renewal. No DNS/ACM permissions are added to Lambda runtime or GitHub code-deployment roles; the operator applying Terraform manages these resources.
+
+`APP_PUBLIC_URL` is derived directly from the configured hostname, so Lambda creation does not depend on certificate validation, DNS, or API mapping. Certificate validation feeds the custom domain, and that domain plus the API stage feed the mapping; this avoids a Lambda/API/domain dependency cycle.
 
 Commit `.terraform.lock.hcl` for each module; never commit `.terraform/`, local/remote state files, plans, backend generated files, `.env`, or the built binary. Provider checksums can be expanded with `terraform providers lock -platform=linux_amd64 -platform=darwin_arm64`.
 

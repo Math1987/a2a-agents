@@ -1,5 +1,11 @@
 output "api_url" {
-  value = aws_apigatewayv2_api.api.api_endpoint
+  description = "Canonical API URL; also used as the OAuth callback origin."
+  value       = local.public_url
+  depends_on  = [aws_apigatewayv2_api_mapping.api, aws_route53_record.api]
+}
+output "execute_api_url" {
+  description = "Underlying API Gateway endpoint for diagnostics; OAuth uses api_url."
+  value       = aws_apigatewayv2_api.api.api_endpoint
 }
 output "table_name" {
   value = aws_dynamodb_table.app.name

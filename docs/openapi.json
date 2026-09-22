@@ -7,6 +7,10 @@
   },
   "servers": [
     {
+      "url": "https://agents.aithos.app",
+      "description": "Canonical deployed API and OAuth callback origin."
+    },
+    {
       "url": "http://127.0.0.1:3188",
       "description": "Ephemeral local mode; metadata only unless Bedrock explicitly enabled."
     },

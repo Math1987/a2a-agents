@@ -2,6 +2,8 @@
 
 Phase 1 of a configurable agent service: create an agent publicly, retain its single owner key, attach Markdown skills and remote MCP connectors, then submit tasks to a Rust worker powered by Amazon Bedrock.
 
+Public API: **https://agents.aithos.app**. See the [live OpenAPI contract](https://agents.aithos.app/openapi.json), [API guide](docs/api.md) and [verification report](docs/verification.md).
+
 The owner key authorizes configuration and invocation. The public card describes the agent and its skills using the A2A Agent Card structure, with a **custom REST protocol binding**. An A2A protocol endpoint, Aithos-issued caller authentication, an agent directory, and a web interface are future phases. This release does not advertise JSON-RPC/A2A methods that it cannot execute.
 
 ## Start locally

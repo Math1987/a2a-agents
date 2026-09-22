@@ -13,6 +13,25 @@ variable "name" {
   default = "a2a-agents-poc"
 }
 
+variable "dns_zone_name" {
+  description = "Exact name of the existing public Route 53 hosted zone."
+  type        = string
+  default     = "aithos.app"
+}
+
+variable "api_domain_name" {
+  description = "Canonical HTTPS hostname for API requests, Agent Cards and OAuth callbacks."
+  type        = string
+  default     = "agents.aithos.app"
+  validation {
+    condition = (
+      can(regex("^[a-z0-9][a-z0-9.-]*[a-z0-9]$", var.api_domain_name)) &&
+      (var.api_domain_name == trimsuffix(var.dns_zone_name, ".") || endswith(var.api_domain_name, ".${trimsuffix(var.dns_zone_name, ".")}"))
+    )
+    error_message = "The API domain must be a lowercase hostname in the configured DNS zone, without scheme, path or trailing dot."
+  }
+}
+
 variable "bootstrap_path" {
   description = "Linux x86_64 Lambda executable. Build with scripts/build-lambda.sh first."
   type        = string

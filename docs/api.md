@@ -3,7 +3,7 @@
 The examples use placeholders. `BASE` is your deployed API origin; `AGENT_ID`, `OWNER_KEY` and `CONNECTOR_ID` come from earlier responses. Use local mode for metadata tests, and the deployed HTTPS API for OAuth and durable execution.
 
 ```sh
-BASE='https://YOUR_API_ID.execute-api.eu-west-3.amazonaws.com'
+BASE='https://agents.aithos.app'
 AGENT_ID='AGENT_ID'
 OWNER_KEY='OWNER_KEY'
 CONNECTOR_ID='CONNECTOR_ID'
