@@ -98,7 +98,7 @@ A skill may have no connectors for a text-only task. It needs `name`, `descripti
 curl -sS "$BASE/agents/$AGENT_ID/agent-card.json"
 ```
 
-The public card exposes descriptions, skill names and access requirements. Its protocol binding is `https://aithos.world/protocols/agents-rest/v1`. This is an A2A-shaped discovery document for the custom REST interface; there is no A2A JSON-RPC, gRPC, streaming or Aithos caller-token endpoint in phase 1.
+The public card exposes descriptions, skill names and access requirements. It advertises the A2A 1.0 `JSONRPC` interface at `/agents/{agent}/a2a`. See the [A2A guide](a2a.md) for asynchronous invocation, durable conversations, SDK clients and optional invocation-only JWT authentication. The REST routes below remain owner-only.
 
 ## 4. Submit and poll a task
 

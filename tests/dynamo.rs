@@ -35,6 +35,62 @@ fn item(number: usize) -> Value {
 }
 
 #[tokio::test]
+async fn bounded_listing_preserves_partition_cursor_and_limit_through_real_sdk() {
+    let server = MockServer::start().await;
+    Mock::given(header("x-amz-target", "DynamoDB_20120810.Query"))
+        .respond_with(|request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["Limit"], 1);
+            assert_eq!(body["ConsistentRead"], true);
+            assert_eq!(body["ExpressionAttributeValues"][":pk"]["S"], "AGENT#002");
+            assert_eq!(body["ExpressionAttributeValues"][":prefix"]["S"], "CONN#");
+            if body.get("ExclusiveStartKey").is_none() {
+                response(200, json!({"Items":[item(2)], "LastEvaluatedKey":{"pk":{"S":"AGENT#002"},"sk":{"S":"CONN#002"}}}))
+            } else {
+                assert_eq!(body["ExclusiveStartKey"], json!({"pk":{"S":"AGENT#002"},"sk":{"S":"CONN#002"}}));
+                response(200, json!({"Items":[]}))
+            }
+        }).expect(2).mount(&server).await;
+    let db = store(&server, "agents-test");
+    let page = db.list_page("AGENT#002", "CONN#", None, 1).await.unwrap();
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(page.next_key.as_deref(), Some("CONN#002"));
+    let last = db
+        .list_page("AGENT#002", "CONN#", page.next_key.as_deref(), 1)
+        .await
+        .unwrap();
+    assert!(last.rows.is_empty());
+    assert!(last.next_key.is_none());
+    assert!(db.list_page("AGENT#002", "CONN#", None, 101).await.is_err());
+    assert!(
+        db.list_page("AGENT#002", "CONN#", Some("META"), 1)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn memory_pages_have_no_overlap_or_cross_partition_rows() {
+    let db = MemoryStore::default();
+    for (pk, sk) in [
+        ("A", "TASK#1"),
+        ("A", "TASK#2"),
+        ("A", "META"),
+        ("B", "TASK#3"),
+    ] {
+        assert!(db.put(Row::new(pk, sk, json!({})), None).await.unwrap());
+    }
+    let first = db.list_page("A", "TASK#", None, 1).await.unwrap();
+    assert_eq!(first.rows[0].sk, "TASK#1");
+    let second = db
+        .list_page("A", "TASK#", first.next_key.as_deref(), 1)
+        .await
+        .unwrap();
+    assert_eq!(second.rows[0].sk, "TASK#2");
+    assert!(second.next_key.is_none());
+}
+
+#[tokio::test]
 async fn conditional_put_serializes_versions_ttl_and_index_and_propagates_non_conflicts() {
     let server = MockServer::start().await;
     Mock::given(header("x-amz-target", "DynamoDB_20120810.PutItem"))

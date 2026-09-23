@@ -200,25 +200,69 @@ pub async fn run_task(app: App, agent_id: &str, task_id: &str) -> anyhow::Result
     if !app.store.put(row, Some(version)).await? {
         return Ok(());
     }
+    let claimed_version = version + 1;
     tracing::info!(event = "task_started", task_id);
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(240),
         execute_task(app.clone(), &task),
     )
     .await;
+    finish_task(&app, &task, claimed_version, result).await
+}
+
+async fn finish_task(
+    app: &App,
+    claimed: &Task,
+    claimed_version: u64,
+    result: Result<Result<EngineOutput, EngineError>, tokio::time::error::Elapsed>,
+) -> anyhow::Result<()> {
+    let task_id = claimed.id.as_str();
+    let pk = agent_pk(&claimed.agent_id);
+    let sk = format!("TASK#{task_id}");
     let Some(mut row) = app.store.get(&pk, &sk).await? else {
         return Ok(());
     };
-    if row.payload.is_null() {
+    if row.payload.is_null() || row.version != claimed_version {
         return Ok(());
     }
     let mut current: Task = serde_json::from_value(row.payload.clone())?;
-    if current.status != "running" {
+    if current.status != "running"
+        || current.a2a.as_ref().map(|state| state.turn)
+            != claimed.a2a.as_ref().map(|state| state.turn)
+    {
         return Ok(());
     }
     match result {
-        Ok(Ok(output)) => {
-            current.status = "completed".into();
+        Ok(Ok(mut output)) => {
+            current.status = if current.a2a.is_some() && output.input_required.is_some() {
+                "input_required"
+            } else {
+                "completed"
+            }
+            .into();
+            current.error = None;
+            if let Some(state) = &mut current.a2a {
+                state.engine_history = std::mem::take(&mut output.history);
+                state.messages.push(ConversationMessage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: "agent".into(),
+                    text: output.text.clone(),
+                });
+                if let Some(previous) = &current.result {
+                    output.usage.input_tokens = output
+                        .usage
+                        .input_tokens
+                        .saturating_add(previous.usage.input_tokens);
+                    output.usage.output_tokens = output
+                        .usage
+                        .output_tokens
+                        .saturating_add(previous.usage.output_tokens);
+                    output.cost_microusd =
+                        output.cost_microusd.saturating_add(previous.cost_microusd);
+                    output.model_calls = output.model_calls.saturating_add(previous.model_calls);
+                    output.tool_calls = output.tool_calls.saturating_add(previous.tool_calls);
+                }
+            }
             current.result = Some(output);
         }
         Ok(Err(error)) => {
@@ -255,11 +299,20 @@ pub async fn run_task(app: App, agent_id: &str, task_id: &str) -> anyhow::Result
     }
     current.updated_at = now();
     current.lease_until = 0;
-    let v = row.version;
+    // DynamoDB's item limit also includes attributes outside payload. Fail
+    // closed rather than dropping history and permitting an unsafe continuation.
+    if serde_json::to_vec(&current)?.len() > 350 * 1024 {
+        current = serde_json::from_value(row.payload.clone())?;
+        current.status = "interrupted".into();
+        current.error = Some("conversation_checkpoint_limit_do_not_retry_blindly".into());
+        current.updated_at = now();
+        current.lease_until = 0;
+    }
     row.payload = json!(current);
     row.due = None;
-    if !app.store.put(row, Some(v)).await? {
-        anyhow::bail!("task completion conflict")
+    if !app.store.put(row, Some(claimed_version)).await? {
+        // Cancellation or another state transition won. Never overwrite it.
+        return Ok(());
     }
     tracing::info!(event="task_finished",task_id,status=%current.status);
     Ok(())
@@ -349,6 +402,10 @@ async fn execute_with_sessions(
             instructions,
             request: task.request.clone(),
             tools,
+            continuation: task.a2a.as_ref().map(|state| EngineContinuation {
+                turn: state.turn,
+                history: state.engine_history.clone(),
+            }),
         })
         .await
 }
@@ -717,6 +774,7 @@ mod tests {
             result: None,
             error: None,
             lease_until: if status == "running" { now() - 1 } else { 0 },
+            a2a: None,
         };
         let mut row = Row::new(agent_pk("agent"), "TASK#task", json!(task));
         row.due = Some(("TASK".into(), now() - 1));
@@ -783,6 +841,182 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(after.version, first.version);
+    }
+
+    fn conversation_output(question: bool) -> EngineOutput {
+        let text = if question {
+            "Which calendar?"
+        } else {
+            "The requested event is recorded."
+        };
+        EngineOutput {
+            text: text.into(),
+            usage: Usage {
+                input_tokens: 100,
+                output_tokens: 10,
+            },
+            cost_microusd: 165,
+            model_calls: 1,
+            tool_calls: 1,
+            input_required: question.then(|| text.to_owned()),
+            history: vec![
+                Message {
+                    role: Role::User,
+                    content: vec![Block::Text {
+                        text: "Create an event".into(),
+                    }],
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: vec![Block::Text { text: text.into() }],
+                },
+            ],
+        }
+    }
+
+    async fn running_conversation(app: &App) -> (Task, u64) {
+        add_task(app, "running").await;
+        let mut row = app
+            .store
+            .get(&agent_pk("agent"), "TASK#task")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut task: Task = serde_json::from_value(row.payload.clone()).unwrap();
+        task.a2a = Some(A2aTaskData {
+            caller_id: "caller".into(),
+            context_id: "context".into(),
+            turn: 0,
+            engine_history: vec![],
+            messages: vec![ConversationMessage {
+                id: "message-1".into(),
+                role: "user".into(),
+                text: task.request.clone(),
+            }],
+        });
+        task.lease_until = now() + 270;
+        row.payload = json!(task);
+        let version = row.version;
+        assert!(app.store.put(row, Some(version)).await.unwrap());
+        (task, version + 1)
+    }
+
+    #[tokio::test]
+    async fn a2a_checkpoint_and_public_question_are_atomic_and_usage_is_cumulative() {
+        let app = fixture().await;
+        let (first, version) = running_conversation(&app).await;
+        let output = conversation_output(true);
+        finish_task(&app, &first, version, Ok(Ok(output.clone())))
+            .await
+            .unwrap();
+        let mut row = app
+            .store
+            .get(&agent_pk("agent"), "TASK#task")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.payload["status"], "input_required");
+        assert_eq!(row.payload["a2a"]["messages"][1]["role"], "agent");
+        assert_eq!(row.payload["a2a"]["messages"][1]["text"], "Which calendar?");
+        assert_eq!(row.payload["a2a"]["engine_history"], json!(output.history));
+        assert!(row.payload["result"].get("history").is_none());
+        assert!(row.due.is_none());
+        assert_eq!(row.payload["lease_until"], 0);
+        // Simulate the handler's accepted answer and the next worker claim.
+        let version = row.version;
+        let mut next: Task = serde_json::from_value(row.payload.clone()).unwrap();
+        next.status = "running".into();
+        next.request = "Personal calendar".into();
+        let state = next.a2a.as_mut().unwrap();
+        state.turn += 1;
+        state.messages.push(ConversationMessage {
+            id: "message-2".into(),
+            role: "user".into(),
+            text: next.request.clone(),
+        });
+        row.payload = json!(next);
+        row.due = Some(("TASK".into(), now() + 270));
+        assert!(app.store.put(row, Some(version)).await.unwrap());
+        finish_task(&app, &next, version + 1, Ok(Ok(conversation_output(false))))
+            .await
+            .unwrap();
+        // A duplicate worker result cannot double-charge reported usage or append again.
+        finish_task(&app, &next, version + 1, Ok(Ok(conversation_output(false))))
+            .await
+            .unwrap();
+        let final_row = app
+            .store
+            .get(&agent_pk("agent"), "TASK#task")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_row.payload["status"], "completed");
+        assert_eq!(final_row.payload["result"]["cost_microusd"], 330);
+        assert_eq!(final_row.payload["result"]["usage"]["input_tokens"], 200);
+        assert_eq!(final_row.payload["result"]["model_calls"], 2);
+        assert_eq!(final_row.payload["result"]["tool_calls"], 2);
+        assert_eq!(
+            final_row.payload["a2a"]["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert!(final_row.payload["result"].get("input_required").is_none());
+    }
+
+    #[tokio::test]
+    async fn old_worker_completion_cannot_overwrite_a_new_turn_or_cancellation() {
+        for status in ["running", "cancelled"] {
+            let app = fixture().await;
+            let (claimed, version) = running_conversation(&app).await;
+            let mut newer = app
+                .store
+                .get(&agent_pk("agent"), "TASK#task")
+                .await
+                .unwrap()
+                .unwrap();
+            newer.payload["status"] = json!(status);
+            newer.payload["a2a"]["turn"] = json!(1);
+            newer.payload["request"] = json!("Newer request must remain untouched");
+            let expected_payload = newer.payload.clone();
+            assert!(app.store.put(newer, Some(version)).await.unwrap());
+            finish_task(&app, &claimed, version, Ok(Ok(conversation_output(true))))
+                .await
+                .unwrap();
+            let after = app
+                .store
+                .get(&agent_pk("agent"), "TASK#task")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.version, version + 1);
+            assert_eq!(after.payload, expected_payload);
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_conversation_is_interrupted_without_dropping_its_old_checkpoint() {
+        let app = fixture().await;
+        let (task, version) = running_conversation(&app).await;
+        let mut output = conversation_output(true);
+        output.text = "x".repeat(360 * 1024);
+        finish_task(&app, &task, version, Ok(Ok(output)))
+            .await
+            .unwrap();
+        let row = app
+            .store
+            .get(&agent_pk("agent"), "TASK#task")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.payload["status"], "interrupted");
+        assert_eq!(
+            row.payload["error"],
+            "conversation_checkpoint_limit_do_not_retry_blindly"
+        );
+        assert_eq!(row.payload["a2a"], json!(task.a2a));
+        assert!(row.due.is_none());
     }
 
     #[tokio::test]

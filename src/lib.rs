@@ -1,3 +1,5 @@
+pub mod a2a;
+pub mod a2a_auth;
 pub mod api;
 pub mod app;
 pub mod budget;

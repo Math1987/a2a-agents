@@ -44,7 +44,33 @@ An event-creation attempt returned a final response reporting uncertainty. Piped
 
 The dynamic-discovery correction passes **62 Rust tests**: 41 library tests, 15 API tests and 6 DynamoDB SDK tests. A local Streamable HTTP server exercises the actual MCP SDK's session preservation and changing tool schemas. Worker tests enforce exact allowlists and revocation; engine tests cover new execution tools, stale batch calls, invalid discovery, timeouts and removal of every tool. Bedrock SDK HTTP tests verify that token counting and inference receive the same history even after every tool is removed.
 
+On 2026-09-23, after confirming the first event was absent, the owner submitted a new reservation on a future half-hour interval. The agent returned an event ID, exact timestamps and a provider link; the owner confirmed the event in Google Calendar. The task used 4 model calls and 3 MCP calls, costing 30,908 micro-USD. This validates owner-guided creation after the dynamic-tool correction, not autonomous negotiation between two calendar agents.
+
 No personal calendar identifiers, owner keys or OAuth credentials are included in this report. The original task is not automatically replayed.
+
+## A2A server verification — 2026-09-23
+
+The official Rust SDK provides the A2A 1.0 JSON-RPC transport and protocol types.
+The complete local suite passes **92 Rust tests**: 67 library tests, 2 actual
+SDK/HTTP integration tests, 15 REST/contract tests and 8 storage/SDK tests.
+Formatting and Clippy with warnings denied also pass.
+
+The official Python SDK 1.1.5 independently parses the card with strict ProtoJSON
+and passes discovery, asynchronous SendMessage, idempotent retries, GetTask,
+ListTasks and cancellation against the local server. This check runs in CI,
+uses no model and deletes its disposable agent.
+
+Regression coverage includes JWT signature/issuer/audience/agent/skill checks,
+caller isolation, bounded JWKS rotation, private checkpoint filtering, atomic
+conversation receipts, input-required continuation, cumulative budget accounting,
+old-worker fencing, bounded pagination and checkpoint limits. Restoring a
+checkpoint does not replay earlier MCP calls. The SDK normalizes nonpositive
+list page sizes; the documented endpoint otherwise limits pages to 100 records.
+
+The deployed endpoint requires explicit asynchronous requests and polling.
+Streaming, push notifications and the default blocking SendMessage mode are not
+supported. Aithos JWT verification remains disabled until an issuer is configured.
+See [the A2A guide](a2a.md) for these compatibility limits and the live smoke command.
 
 ## Remaining provider checks
 
