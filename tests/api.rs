@@ -248,10 +248,10 @@ async fn public_card_exposes_skill_capabilities_without_private_instructions_or_
     let binding = response.json["supportedInterfaces"][0]["protocolBinding"]
         .as_str()
         .unwrap();
-    assert!(
-        binding.contains("agents-rest"),
-        "phase 1 must not advertise an unimplemented A2A binding"
-    );
+    assert_eq!(binding, "JSONRPC");
+    let card: a2a_protocol::AgentCard = serde_json::from_value(response.json).unwrap();
+    assert_eq!(card.supported_interfaces[0].protocol_version, "1.0");
+    assert!(card.security_requirements.unwrap()[0].contains_key("owner"));
 
     assert_eq!(
         client
@@ -691,7 +691,11 @@ fn matches_openapi_schema(name: &str, instance: &Value) {
     let validator = jsonschema::validator_for(&schema).unwrap();
     assert!(
         validator.is_valid(instance),
-        "API response violates documented {name} schema"
+        "API response violates documented {name} schema: {:?}",
+        validator
+            .iter_errors(instance)
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -769,6 +773,8 @@ async fn live_route_responses_match_the_published_openapi_contract() {
         cost_microusd: 165,
         model_calls: 1,
         tool_calls: 0,
+        input_required: None,
+        history: vec![],
     })
     .unwrap();
     assert!(client.app.store.put(row, Some(version)).await.unwrap());

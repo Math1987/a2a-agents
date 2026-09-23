@@ -14,6 +14,10 @@ pub struct Row {
     pub expires_at: Option<i64>,
     pub due: Option<(String, i64)>,
 }
+pub struct Page {
+    pub rows: Vec<Row>,
+    pub next_key: Option<String>,
+}
 impl Row {
     pub fn new(pk: impl Into<String>, sk: impl Into<String>, payload: Value) -> Self {
         Self {
@@ -34,6 +38,14 @@ pub trait Store: Send + Sync {
     async fn put(&self, row: Row, expected: Option<u64>) -> anyhow::Result<bool>;
     async fn transaction(&self, rows: Vec<(Row, Option<u64>)>) -> anyhow::Result<bool>;
     async fn list(&self, pk: &str, prefix: &str) -> anyhow::Result<Vec<Row>>;
+    /// A bounded, ordered partition query. The cursor is a sort key in this partition.
+    async fn list_page(
+        &self,
+        pk: &str,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Page>;
     async fn due(&self, kind: &str, before: i64) -> anyhow::Result<Vec<Row>>;
 }
 
@@ -80,6 +92,40 @@ impl Store for MemoryStore {
             .filter(|r| r.pk == pk && r.sk.starts_with(prefix))
             .cloned()
             .collect())
+    }
+    async fn list_page(
+        &self,
+        pk: &str,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Page> {
+        anyhow::ensure!((1..=100).contains(&limit), "invalid page size");
+        anyhow::ensure!(
+            after.is_none_or(|key| key.starts_with(prefix)),
+            "invalid page cursor"
+        );
+        let mut rows: Vec<_> = self
+            .0
+            .lock()
+            .await
+            .values()
+            .filter(|row| {
+                row.pk == pk
+                    && row.sk.starts_with(prefix)
+                    && after.is_none_or(|key| row.sk.as_str() > key)
+            })
+            .take(limit + 1)
+            .cloned()
+            .collect();
+        let more = rows.len() > limit;
+        rows.truncate(limit);
+        let next_key = if more {
+            rows.last().map(|r| r.sk.clone())
+        } else {
+            None
+        };
+        Ok(Page { rows, next_key })
     }
     async fn due(&self, kind: &str, before: i64) -> anyhow::Result<Vec<Row>> {
         let mut rows: Vec<_> = self
@@ -273,6 +319,51 @@ impl Store for DynamoStore {
             }
         }
         Ok(rows)
+    }
+    async fn list_page(
+        &self,
+        pk: &str,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Page> {
+        anyhow::ensure!((1..=100).contains(&limit), "invalid page size");
+        anyhow::ensure!(
+            after.is_none_or(|key| key.starts_with(prefix)),
+            "invalid page cursor"
+        );
+        let mut request = self
+            .client
+            .query()
+            .table_name(&self.table)
+            .key_condition_expression("pk = :pk")
+            .expression_attribute_values(":pk", Av::S(pk.into()))
+            .consistent_read(true)
+            .limit(limit as i32);
+        if !prefix.is_empty() {
+            request = request
+                .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+                .expression_attribute_values(":prefix", Av::S(prefix.into()));
+        }
+        if let Some(sk) = after {
+            request = request
+                .exclusive_start_key("pk", Av::S(pk.into()))
+                .exclusive_start_key("sk", Av::S(sk.into()));
+        }
+        let output = request.send().await?;
+        let next_key = output
+            .last_evaluated_key
+            .as_ref()
+            .and_then(|m| m.get("sk"))
+            .and_then(|v| v.as_s().ok())
+            .cloned();
+        let rows = output
+            .items
+            .unwrap_or_default()
+            .into_iter()
+            .map(Self::decode)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Page { rows, next_key })
     }
     async fn due(&self, kind: &str, before: i64) -> anyhow::Result<Vec<Row>> {
         let mut rows = Vec::new();

@@ -36,7 +36,9 @@ Tokio handles asynchronous work; Serde encodes data; AWS clients use the officia
 
 Anyone can create an agent. Its single, randomly generated 256-bit owner secret authorizes management and invocation; only its SHA-256 digest is retained. Data keys include the agent ID, and each request verifies ownership of that agent. Connector references cannot cross agents.
 
-Public cards expose descriptions and skill metadata. They use the A2A Agent Card structure and a custom REST `protocolBinding`; they do not advertise an implemented A2A transport. A2A invocation and Aithos-issued caller authentication belong to phase 2. No agent catalogue or separate invocation key is present.
+Public cards expose descriptions and skill metadata and advertise the A2A 1.0 JSON-RPC interface implemented by the official Rust SDK. The A2A adapter captures the authenticated agent/caller before invoking the SDK router and reuses the existing durable worker. REST administration accepts only the owner key. Optional RS256 JWT verification accepts a configured trusted issuer, audience, target agent and explicit skill grants only on A2A routes; it is disabled without issuer configuration. There is no separate permanent invocation key or agent catalogue. See [A2A](a2a.md) for the token contract and asynchronous-only compatibility limit.
+
+A2A tasks carry a caller identity, context, public messages, a turn number and a private model checkpoint. Message receipts are scoped to agent/caller/message ID and created atomically with task transitions. A clarification persists an `input_required` checkpoint; a later message queues a new turn of the same task. Budget reservations include this turn number. Worker completion checks both its claimed record version and turn, preventing an older execution from overwriting newer state. Restored tool history is input to the next model call, not a queue of actions to replay.
 
 ## OAuth across Lambda invocations
 

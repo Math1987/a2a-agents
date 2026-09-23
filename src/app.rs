@@ -14,6 +14,7 @@ pub struct App {
     pub count_model_id: String,
     pub monthly_budget: u64,
     pub engine_config: crate::engine::EngineConfig,
+    pub a2a_auth: Option<Arc<crate::a2a_auth::A2aAuthConfig>>,
 }
 impl App {
     pub async fn enqueue(&self, agent_id: &str, task_id: &str) -> anyhow::Result<()> {
@@ -49,6 +50,7 @@ impl App {
             count_model_id: String::new(),
             monthly_budget: 25_000_000,
             engine_config: Default::default(),
+            a2a_auth: None,
         })
     }
 }

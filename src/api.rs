@@ -56,11 +56,12 @@ fn missing() -> ApiError {
 pub fn router(app: App) -> Router {
     Router::new().route("/health",get(||async{Json(json!({"status":"ok","service":"a2a-agents"}))}))
       .route("/openapi.json",get(||async{([("content-type","application/json")],include_str!("../docs/openapi.json"))}))
-      .route("/",get(||async{Json(json!({"service":"Aithos Agents","version":"0.1.0","docs":"https://github.com/Math1987/a2a-agents","phase":1}))}))
+      .route("/",get(||async{Json(json!({"service":"Aithos Agents","version":"0.2.0","docs":"https://github.com/Math1987/a2a-agents","phase":2}))}))
       .route("/v1/agents",post(create_agent))
       .route("/v1/agents/{agent}",get(get_agent).patch(update_agent).delete(delete_agent))
       .route("/v1/agents/{agent}/key",post(rotate_key))
       .route("/agents/{agent}/agent-card.json",get(card))
+      .route("/agents/{agent}/.well-known/agent-card.json",get(card))
       .route("/v1/agents/{agent}/skills",get(list_skills))
       .route("/v1/agents/{agent}/skills/{skill}",put(save_skill).delete(remove_skill))
       .route("/v1/agents/{agent}/connectors",post(create_connection).get(list_connections))
@@ -70,9 +71,10 @@ pub fn router(app: App) -> Router {
       .route("/oauth/callback/{agent}/{connection}",get(callback))
       .route("/v1/agents/{agent}/tasks",post(create_task).get(list_tasks))
       .route("/v1/agents/{agent}/tasks/{task}",get(get_task))
+      .with_state(app.clone())
+      .merge(crate::a2a::router(app))
       .layer(DefaultBodyLimit::max(64*1024))
       .layer(axum::middleware::map_response(|mut response:Response|async move {response.headers_mut().insert("cache-control","no-store".parse().unwrap());response.headers_mut().insert("referrer-policy","no-referrer".parse().unwrap());response.headers_mut().insert("x-content-type-options","nosniff".parse().unwrap());response}))
-      .with_state(app)
 }
 pub async fn agent(app: &App, id: &str) -> Result<(Row, Agent), ApiError> {
     let row = app
@@ -204,7 +206,7 @@ async fn delete_agent(
     }
     Ok(StatusCode::NO_CONTENT)
 }
-async fn skills(app: &App, id: &str) -> Result<Vec<Skill>, ApiError> {
+pub(crate) async fn skills(app: &App, id: &str) -> Result<Vec<Skill>, ApiError> {
     Ok(app
         .store
         .list(&agent_pk(id), "SKILL#")
@@ -275,11 +277,97 @@ async fn remove_skill(
     Ok(StatusCode::NO_CONTENT)
 }
 async fn card(State(app): State<App>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
-    let (_, a) = agent(&app, &id).await?;
-    let sk = skills(&app, &id).await?;
-    Ok(Json(
-        json!({"name":a.name,"description":a.description,"version":"0.1.0","supportedInterfaces":[{"url":format!("{}/v1/agents/{id}/tasks",app.public_url),"protocolBinding":"https://aithos.world/protocols/agents-rest/v1","protocolVersion":"1.0"}],"capabilities":{},"defaultInputModes":["text/plain"],"defaultOutputModes":["text/plain"],"skills":sk.into_iter().map(|s|json!({"id":s.id,"name":s.name,"description":s.description,"tags":["configured-skill"]})).collect::<Vec<_>>(),"securitySchemes":{"owner":{"httpAuthSecurityScheme":{"scheme":"Bearer"}}},"security":[{"owner":[]}]}),
-    ))
+    let card = agent_card(&app, &id).await?;
+    let mut value = a2a_pb::protojson_conv::to_value(&card)
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "invalid_agent_card"))?;
+    // Keep the existing public card contract explicit even when ProtoJSON
+    // would omit an empty scalar or repeated field. Both forms are valid.
+    value["description"] = json!(card.description);
+    if card.skills.is_empty() {
+        value["skills"] = json!([]);
+    }
+    // ProtoJSON's omitted empty StringList is equivalent to {"list":[]}.
+    // Emit the latter explicitly: a2a-lf 0.3.1's card resolver accepts the
+    // canonical wrapper but requires this default field to be present.
+    if let Some(requirements) = value
+        .get_mut("securityRequirements")
+        .and_then(Value::as_array_mut)
+    {
+        for requirement in requirements {
+            if let Some(schemes) = requirement
+                .get_mut("schemes")
+                .and_then(Value::as_object_mut)
+            {
+                for scopes in schemes.values_mut() {
+                    if let Some(scopes) = scopes.as_object_mut() {
+                        scopes.entry("list").or_insert_with(|| json!([]));
+                    }
+                }
+            }
+        }
+    }
+    Ok(Json(value))
+}
+pub(crate) async fn agent_card(app: &App, id: &str) -> Result<a2a_protocol::AgentCard, ApiError> {
+    use a2a_protocol::{
+        AgentCapabilities, AgentCard, AgentInterface, AgentSkill, HttpAuthSecurityScheme,
+        SecurityScheme,
+    };
+    let (_, a) = agent(app, id).await?;
+    let sk = skills(app, id).await?;
+    let mut schemes = std::collections::HashMap::from([(
+        "owner".into(),
+        SecurityScheme::HttpAuth(HttpAuthSecurityScheme {
+            scheme: "Bearer".into(),
+            description: Some("Owner key for this agent.".into()),
+            bearer_format: None,
+        }),
+    )]);
+    let mut requirements = vec![std::collections::HashMap::from([("owner".into(), vec![])])];
+    if app.a2a_auth.is_some() {
+        schemes.insert("aithos".into(), SecurityScheme::HttpAuth(HttpAuthSecurityScheme {
+            scheme: "Bearer".into(), description: Some("Aithos access token scoped to this agent and its permitted skills; invocation only.".into()), bearer_format: Some("JWT".into()),
+        }));
+        requirements.push(std::collections::HashMap::from([("aithos".into(), vec![])]));
+    }
+    Ok(AgentCard {
+        name: a.name,
+        description: a.description,
+        version: "0.2.0".into(),
+        supported_interfaces: vec![AgentInterface::new(
+            format!("{}/agents/{id}/a2a", app.public_url),
+            "JSONRPC",
+        )],
+        capabilities: AgentCapabilities {
+            streaming: Some(false),
+            push_notifications: Some(false),
+            extended_agent_card: Some(false),
+            ..Default::default()
+        },
+        default_input_modes: vec!["text/plain".into()],
+        default_output_modes: vec!["text/plain".into()],
+        skills: sk
+            .into_iter()
+            .map(|s| AgentSkill {
+                id: s.id,
+                name: s.name,
+                description: s.description,
+                tags: vec!["configured-skill".into()],
+                examples: None,
+                input_modes: None,
+                output_modes: None,
+                security_requirements: None,
+            })
+            .collect(),
+        provider: None,
+        documentation_url: Some(
+            "https://github.com/Math1987/a2a-agents/blob/main/docs/a2a.md".into(),
+        ),
+        icon_url: None,
+        security_schemes: Some(schemes),
+        security_requirements: Some(requirements),
+        signatures: None,
+    })
 }
 pub async fn connection(app: &App, agent: &str, id: &str) -> Result<(Row, Connection), ApiError> {
     let row = app
@@ -641,6 +729,7 @@ async fn create_task(
         result: None,
         error: None,
         lease_until: 0,
+        a2a: None,
     };
     let mut row = Row::new(
         agent_pk(&id),

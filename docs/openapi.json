@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Aithos Agents API",
-    "version": "0.1.0",
-    "description": "Phase 1: public agent creation, one owner key, Markdown skills, remote MCP connectors and asynchronous tasks. One global model budget; no A2A invocation transport yet."
+    "version": "0.2.0",
+    "description": "Owner REST API for agent configuration, MCP connectors and asynchronous tasks. Public cards advertise A2A 1.0 JSON-RPC; see docs/a2a.md for the asynchronous-only profile and optional invocation-only authentication."
   },
   "servers": [
     {
@@ -240,7 +240,7 @@
     "/agents/{agent}/agent-card.json": {
       "get": {
         "operationId": "agentCard",
-        "summary": "Public card with custom REST binding",
+        "summary": "Public A2A Agent Card",
         "responses": {
           "200": {
             "description": "Success",
@@ -256,7 +256,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "description": "A2A Agent Card structure. Phase 1 exposes a custom REST interface, not an A2A JSON-RPC, gRPC or streaming endpoint.",
+        "description": "Official SDK Agent Card advertising the JSONRPC A2A 1.0 interface. Private instructions and connector credentials are omitted.",
         "security": [],
         "parameters": [
           {
@@ -1270,7 +1270,9 @@
               "running",
               "completed",
               "failed",
-              "interrupted"
+              "interrupted",
+              "input_required",
+              "cancelled"
             ]
           },
           "created_at": {
@@ -1300,6 +1302,10 @@
           "lease_until": {
             "type": "integer",
             "format": "int64"
+          },
+          "a2a": {
+            "type": "object",
+            "description": "Owner-only A2A context, public messages and private execution checkpoint. Never returned through A2A task history."
           }
         },
         "additionalProperties": false,
@@ -1381,10 +1387,10 @@
                   "format": "uri"
                 },
                 "protocolBinding": {
-                  "const": "https://aithos.world/protocols/agents-rest/v1"
+                  "const": "JSONRPC"
                 },
                 "protocolVersion": {
-                  "type": "string"
+                  "const": "1.0"
                 }
               },
               "additionalProperties": false,
@@ -1419,11 +1425,15 @@
           "securitySchemes": {
             "type": "object"
           },
-          "security": {
+          "securityRequirements": {
             "type": "array",
             "items": {
               "type": "object"
             }
+          },
+          "documentationUrl": {
+            "type": "string",
+            "format": "uri"
           }
         },
         "additionalProperties": false,
@@ -1437,7 +1447,7 @@
           "defaultOutputModes",
           "skills",
           "securitySchemes",
-          "security"
+          "securityRequirements"
         ]
       },
       "Health": {
@@ -1470,7 +1480,7 @@
             "format": "uri"
           },
           "phase": {
-            "const": 1
+            "const": 2
           }
         },
         "additionalProperties": false,
@@ -1539,6 +1549,10 @@
           "tool_calls": {
             "type": "integer",
             "minimum": 0
+          },
+          "input_required": {
+            "type": "string",
+            "description": "Question requiring a continuation message; present only for an A2A task awaiting input."
           }
         },
         "required": [

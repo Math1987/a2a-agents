@@ -27,6 +27,12 @@ jobs:
         run: cargo test --locked --all-targets
       - name: Lint
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Verify official Python A2A client interoperability
+        run: |
+          python3 -m venv .build/interop
+          .build/interop/bin/python -m pip install -r scripts/interop-requirements.txt
+          cargo build --locked --bin a2a-agents
+          .build/interop/bin/python scripts/a2a-interop.py --start-server
       - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
         with:
           terraform_version: 1.14.6

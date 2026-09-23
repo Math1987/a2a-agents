@@ -1,10 +1,10 @@
 # Aithos Agents
 
-Phase 1 of a configurable agent service: create an agent publicly, retain its single owner key, attach Markdown skills and remote MCP connectors, then submit tasks to a Rust worker powered by Amazon Bedrock.
+Configurable multi-tenant agents: create an agent publicly, retain its single owner key, attach Markdown skills and remote MCP connectors, then submit REST or A2A tasks to a Rust worker powered by Amazon Bedrock.
 
 Public API: **https://agents.aithos.app**. See the [live OpenAPI contract](https://agents.aithos.app/openapi.json), [API guide](docs/api.md) and [verification report](docs/verification.md).
 
-The owner key authorizes configuration and invocation. The public card describes the agent and its skills using the A2A Agent Card structure, with a **custom REST protocol binding**. An A2A protocol endpoint, Aithos-issued caller authentication, an agent directory, and a web interface are future phases. This release does not advertise JSON-RPC/A2A methods that it cannot execute.
+The owner key authorizes configuration and invocation. The public card advertises an **A2A 1.0 JSON-RPC endpoint** built with the official Rust SDK. This first A2A deployment uses explicit asynchronous requests and polling, and supports durable clarification/continuation. Optional invocation-only JWT verification is ready for a trusted Aithos issuer; issuing these tokens, the Aithos client, an agent directory and a web interface remain future work. See the [A2A guide and compatibility limits](docs/a2a.md).
 
 ## Start locally
 

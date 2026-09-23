@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+futures = "0.3"
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
 tower = { version = "0.5", features = ["util"] }
@@ -37,10 +38,15 @@ aws-sdk-sqs = "1"
 aws-sdk-bedrockruntime = "1"
 aws-smithy-types = "1"
 jsonschema = { version = "0.56", default-features = false }
+a2a_protocol = { package = "a2a-lf", version = "=0.3.1" }
+a2a_pb = { package = "a2a-pb", version = "=0.2.1" }
+a2a_server = { package = "a2a-server-lf", version = "=0.4.4", default-features = false }
+jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
 wiremock = "0.6"
+a2a_client = { package = "a2a-client-lf", version = "=0.2.5", default-features = false }
 
 [profile.release]
 strip = true

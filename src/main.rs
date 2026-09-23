@@ -9,7 +9,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter("off,a2a_agents=info")
         .init();
     let mode = std::env::var("APP_MODE").unwrap_or_else(|_| "local".into());
-    let app = if mode == "local" {
+    let mut app = if mode == "local" {
         let mut app = App::local().await?;
         if std::env::var("APP_LOCAL_BEDROCK").is_ok() {
             app.aws = Some(aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await);
@@ -51,8 +51,10 @@ async fn main() -> anyhow::Result<()> {
             count_model_id: std::env::var("APP_COUNT_MODEL_ID")?,
             monthly_budget: env_number("APP_MONTHLY_BUDGET_MICRO_USD", 25_000_000)?,
             engine_config,
+            a2a_auth: None,
         }
     };
+    app.a2a_auth = a2a_agents::a2a_auth::A2aAuthConfig::from_env(app.http.clone())?;
     match mode.as_str() {
         "worker" => {
             lambda_runtime::run(lambda_runtime::service_fn(

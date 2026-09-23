@@ -51,6 +51,25 @@ pub struct Task {
     pub error: Option<String>,
     #[serde(default)]
     pub lease_until: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a2a: Option<A2aTaskData>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct A2aTaskData {
+    pub caller_id: String,
+    pub context_id: String,
+    pub messages: Vec<ConversationMessage>,
+    pub turn: u64,
+    /// Private execution checkpoint, never part of an A2A history response.
+    pub engine_history: Vec<crate::engine::Message>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ConversationMessage {
+    pub id: String,
+    pub role: String,
+    pub text: String,
 }
 pub fn agent_pk(id: &str) -> String {
     format!("AGENT#{id}")
