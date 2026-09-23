@@ -69,7 +69,8 @@ jobs:
           aws-region: eu-west-3
       - name: Update functions
         run: |
-          for mode in api worker; do
+          # Install the backward-compatible consumer before exposing new tasks.
+          for mode in worker api; do
             aws lambda update-function-code \
               --function-name "${APP_NAME}-${mode}" \
               --zip-file fileb://.build/lambda.zip \
