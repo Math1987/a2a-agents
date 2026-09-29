@@ -3,6 +3,7 @@ pub mod a2a_auth;
 pub mod api;
 pub mod app;
 pub mod budget;
+pub mod cards;
 pub mod connectors;
 pub mod crypto;
 pub mod domain;

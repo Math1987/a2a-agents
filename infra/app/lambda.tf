@@ -35,10 +35,13 @@ resource "aws_lambda_function" "app" {
       APP_INPUT_PRICE_PER_MILLION_MICRO_USD  = tostring(var.input_price_per_million_micro_usd)
       APP_OUTPUT_PRICE_PER_MILLION_MICRO_USD = tostring(var.output_price_per_million_micro_usd)
       RUST_LOG                               = "a2a_agents=info,tower_http=info"
-    })
+      }, each.key == "api" ? {
+      APP_CARD_SIGNING_KEY_ID   = local.card_signing_key_arn
+      APP_CARD_RETAINED_KEY_IDS = jsonencode(var.card_retained_key_arns)
+    } : {})
   }
 
-  depends_on = [aws_cloudwatch_log_group.lambda, aws_iam_role_policy.common, aws_iam_role_policy.worker]
+  depends_on = [aws_cloudwatch_log_group.lambda, aws_iam_role_policy.common, aws_iam_role_policy.worker, aws_iam_role_policy.card_signing]
 }
 
 resource "aws_lambda_event_source_mapping" "tasks" {

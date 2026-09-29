@@ -12,6 +12,7 @@ It must have no worker/Bedrock enabled: tasks remain queued and are cancelled.
 The temporary agent is deleted in finally; owner credentials stay in memory.
 """
 
+import importlib.util
 import argparse
 import asyncio
 import ipaddress
@@ -118,6 +119,18 @@ async def exercise(base, public):
                 "instructions": private_instructions, "connector_ids": [],
             })
             raw_card = await rest(public, "GET", base + card_path)
+            spec = importlib.util.spec_from_file_location("verify_card", Path(__file__).with_name("verify-card.py"))
+            verifier = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(verifier)
+            jwks = await rest(public, "GET", base + "/.well-known/jwks.json")
+            verifier.verify(raw_card, jwks, base)
+            altered = dict(raw_card, name="Tampered")
+            try:
+                verifier.verify(altered, jwks, base)
+            except Exception:
+                pass
+            else:
+                raise RuntimeError("Tampered card signature was accepted.")
             # Resolver supports legacy compatibility and ignores unknown fields.
             # Also parse strictly to catch noncanonical ProtoJSON on the wire.
             strict_card = ParseDict(raw_card, a2a.AgentCard())
@@ -140,7 +153,7 @@ async def exercise(base, public):
                         "The card advertised a different origin; refusing to send an owner key.")
                 require(interface.protocol_binding == "JSONRPC" and interface.protocol_version == "1.0",
                         "Unexpected A2A binding or protocol version.")
-            print("PASS: strict ProtoJSON card, skills and bearer requirements", flush=True)
+            print("PASS: strict ProtoJSON card, ES256 signature, tamper rejection, skills and bearer requirements", flush=True)
 
             client = await create_client(card, ClientConfig(
                 httpx_client=owner, streaming=False, polling=True,

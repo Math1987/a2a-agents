@@ -22,3 +22,7 @@ output "kms_key_id" {
 output "lambda_functions" {
   value = { for mode, fn in aws_lambda_function.app : mode => fn.function_name }
 }
+
+output "card_signing_key_arn" {
+  value = local.card_signing_key_arn
+}

@@ -7,7 +7,7 @@ The isolated `a2a-agents-poc` stack uses account `128066560720`, region `eu-west
 - Two Rust Lambda functions (`api`, `worker`), HTTP API Gateway, no VPC or NAT.
 - Regional API Gateway custom domain `agents.aithos.app`, an ACM public certificate in Paris, and DNS records in the existing public `aithos.app` zone.
 - One on-demand DynamoDB table, one task queue plus a dead-letter queue, managed encryption at rest.
-- One customer-managed KMS key for connector credential encryption (a standing key charge, plus request charges).
+- Two customer-managed KMS keys: symmetric connector credential encryption and asymmetric Agent Card signing (standing key charges, plus request charges).
 - CloudWatch logs retained 14 days; access logs omit URLs, query strings, headers, and bodies.
 - Daily OAuth maintenance and a five-minute task-dispatch recovery schedule; these invoke the same worker.
 - One versioned, private, encrypted S3 state bucket and a GitHub OIDC code-deployment role.
@@ -57,3 +57,9 @@ Query `maintenance-index` by partition and `maintenance_due <= now`, paginating 
 The worker receives SQS messages with batch size 1 and supports `ReportBatchItemFailures`. Its timeout is 300 seconds and task queue visibility is 1,800 seconds. Scheduled payloads are `{"kind":"oauth_maintenance"}` and `{"kind":"dispatch_pending"}`. Schedule delivery and SQS are at least once: renewal, claims and side-effect recovery must be coordinated in DynamoDB.
 
 Monitor Lambda errors, task failures, and the dead-letter queue. Inspect failed tasks before redriving them: a timeout does not prove that an external write did not happen. OAuth providers can still require reauthorization when consent is revoked or refresh-token lifetime ends.
+
+## Agent Card signing rollout
+
+See [signing deployment and rotation](../docs/card-signing.md). The first rollout
+requires infrastructure plus code and an operator backfill of existing cards.
+The code-only CI deployment must not precede this infrastructure migration.
