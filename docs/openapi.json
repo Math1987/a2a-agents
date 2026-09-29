@@ -755,6 +755,38 @@
           }
         }
       }
+    },
+    "/.well-known/jwks.json": {
+      "get": {
+        "summary": "Public Aithos Agent Card verification keys",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Public ES256 keys, including retained rotation keys",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "keys"
+                  ],
+                  "properties": {
+                    "keys": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Card signing unavailable"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1434,6 +1466,26 @@
           "documentationUrl": {
             "type": "string",
             "format": "uri"
+          },
+          "signatures": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "properties": {
+                "protected": {
+                  "type": "string"
+                },
+                "signature": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "protected",
+                "signature"
+              ],
+              "additionalProperties": false
+            }
           }
         },
         "additionalProperties": false,
@@ -1447,7 +1499,8 @@
           "defaultOutputModes",
           "skills",
           "securitySchemes",
-          "securityRequirements"
+          "securityRequirements",
+          "signatures"
         ]
       },
       "Health": {

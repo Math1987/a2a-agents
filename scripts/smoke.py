@@ -17,9 +17,17 @@ def main():
     parser.add_argument("base_url")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--mcp", action="store_true")
+    parser.add_argument("--verify-signatures", action="store_true")
     args = parser.parse_args()
     base = args.base_url.rstrip("/")
     key = None
+    verifier = None
+    if args.verify_signatures:
+        import importlib.util
+        from pathlib import Path
+        spec = importlib.util.spec_from_file_location("verify_card", Path(__file__).with_name("verify-card.py"))
+        verifier = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(verifier)
 
     def call(method, path, body=None, auth=True, expected=200, extra=None):
         headers = {"Content-Type": "application/json"}
@@ -49,6 +57,11 @@ def main():
     key = created["owner_key"]
     path = "/v1/agents/" + agent
     try:
+        card_path = "/agents/" + agent + "/agent-card.json"
+        jwks = call("GET", "/.well-known/jwks.json", auth=False) if verifier else None
+        if verifier:
+            verifier.verify(call("GET", card_path, auth=False), jwks, base)
+            print("PASS: card signed automatically at creation", flush=True)
         connectors = []
         instructions = "Answer concisely in French. Follow the user's request."
         request = "Réponds exactement : Le test fonctionne."
@@ -74,6 +87,15 @@ def main():
             "instructions": instructions, "connector_ids": connectors,
         })
         card = call("GET", "/agents/" + agent + "/agent-card.json", auth=False)
+        if verifier:
+            verifier.verify(card, jwks, base)
+            altered = dict(card, name="Tampered")
+            try:
+                verifier.verify(altered, jwks, base)
+            except Exception:
+                pass
+            else:
+                raise RuntimeError("Tampered card signature was accepted")
         assert card["skills"][0]["id"] == "assist"
         assert "instructions" not in card["skills"][0]
         call("GET", path, auth=False, expected=401)
@@ -102,6 +124,16 @@ def main():
         call("GET", path, expected=401, extra={"Authorization": "Bearer " + old_key})
         call("GET", path)
         print("PASS: owner key rotation", flush=True)
+        if verifier:
+            call("PATCH", path, {"name":"Updated signing test", "description":""})
+            changed = call("GET", card_path, auth=False)
+            assert changed["name"] == "Updated signing test"
+            verifier.verify(changed, jwks, base)
+            call("DELETE", path + "/skills/assist", expected=204)
+            changed = call("GET", card_path, auth=False)
+            assert changed["skills"] == []
+            verifier.verify(changed, jwks, base)
+            print("PASS: signature verification, tamper rejection, metadata and skill republication", flush=True)
     finally:
         call("DELETE", path, expected=204)
         call("GET", "/agents/" + agent + "/agent-card.json", auth=False, expected=404)

@@ -6,6 +6,8 @@ Public API: **https://agents.aithos.app**. See the [live OpenAPI contract](https
 
 The owner key authorizes configuration and invocation. The public card advertises an **A2A 1.0 JSON-RPC endpoint** built with the official Rust SDK. This first A2A deployment uses explicit asynchronous requests and polling, and supports durable clarification/continuation. Optional invocation-only JWT verification is ready for a trusted Aithos issuer; issuing these tokens, the Aithos client, an agent directory and a web interface remain future work. See the [A2A guide and compatibility limits](docs/a2a.md).
 
+Agent Cards are automatically signed at creation and on public configuration changes. Public verification keys are available at `/.well-known/jwks.json`. See [signing, verification and rotation](docs/card-signing.md).
+
 ## Start locally
 
 Requires Rust 1.95 or later.
@@ -14,7 +16,7 @@ Requires Rust 1.95 or later.
 cargo run
 ```
 
-The API listens on `http://127.0.0.1:3188`. This default mode uses an in-memory store and an ephemeral encryption key. It supports configuration and task submission; submitted tasks remain queued. Restarting discards all local data and credentials.
+The API listens on `http://127.0.0.1:3188`. This default mode uses an in-memory store and ephemeral encryption and card-signing keys. It supports configuration and task submission; submitted tasks remain queued. Restarting discards all local data and credentials.
 
 ```sh
 curl -sS http://127.0.0.1:3188/health

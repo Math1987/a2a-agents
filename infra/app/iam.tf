@@ -75,3 +75,26 @@ resource "aws_iam_role_policy" "worker" {
     ]
   })
 }
+
+resource "aws_iam_role_policy" "card_signing" {
+  name = "card-signing"
+  role = aws_iam_role.lambda["api"].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["kms:Sign"]
+        Resource = local.card_signing_key_arn
+        Condition = {
+          StringEquals = { "kms:SigningAlgorithm" = "ECDSA_SHA_256" }
+        }
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["kms:GetPublicKey"]
+        Resource = distinct(concat([local.card_signing_key_arn], var.card_retained_key_arns))
+      }
+    ]
+  })
+}

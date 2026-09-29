@@ -1,3 +1,7 @@
 # Official A2A Python SDK, implementing protocol 1.0 (Python >=3.10).
 a2a-sdk==1.1.5
 httpx==0.28.1
+
+# Independent Agent Card signature verification.
+rfc8785==0.1.4
+cryptography==50.0.1

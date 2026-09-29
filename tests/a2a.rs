@@ -56,6 +56,7 @@ async fn official_sdk_client_round_trips_discovery_send_get_list_and_cancel() {
     let url = format!("http://{}", listener.local_addr().unwrap());
     let mut serving = app.clone();
     serving.public_url = url.clone();
+    api::republish_card(&serving, "alpha").await.unwrap();
     let server =
         tokio::spawn(async move { axum::serve(listener, api::router(serving)).await.unwrap() });
     let http = reqwest::Client::builder().no_proxy().build().unwrap();
