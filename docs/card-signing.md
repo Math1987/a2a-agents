@@ -41,8 +41,11 @@ no usable owner key or partial agent. Network loss after a successful creation
 still has the existing one-time-owner-key limitation; this does not add creation
 idempotency or key recovery.
 
-Public GETs read stored CARD snapshots, never call KMS, and retain the API's
-`Cache-Control: no-store` policy. Deleted agents return 404. Legacy agents without
+The public card handler reads stored CARD snapshots, never requests a signature,
+and retains the API's `Cache-Control: no-store` policy. API cold starts load the
+configured public keys from KMS once, so GetPublicKey availability is a startup
+dependency; warm instances can serve cards and JWKS during signing failures.
+Deleted agents return 404. Legacy agents without
 a snapshot return 503 `card_publication_pending` until migrated; there is no
 unsigned fallback. Creating an agent with zero skills signs its initial metadata;
 it does not make the agent ready for useful invocation.
