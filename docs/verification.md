@@ -75,3 +75,31 @@ See [the A2A guide](a2a.md) for these compatibility limits and the live smoke co
 ## Remaining provider checks
 
 A real authenticated connector needs its account owner's consent. For each chosen provider, verify authorization, tool discovery, an allowed read and refresh after the original access token expires. Multi-month grant validity remains subject to provider expiry, revocation and policy; it cannot be established by this short test run.
+
+## Automatic Agent Card signing — 2026-09-29
+
+Deployed the KMS-backed publication implementation to `agents.aithos.app` and
+backfilled both existing agents. The Google Calendar agent's public content is
+identical to its pre-migration card apart from the new `signatures` member:
+JSON-RPC 1.0, authentication requirements, and the `calendrier` and `reservation`
+skills are preserved. The installed A2A CLI can still read it.
+
+All **98 Rust tests** pass (69 library, 2 A2A/HTTP, 19 REST/contract, 8 storage/SDK),
+as do Clippy with warnings denied, formatting and Terraform validation. New
+coverage includes independent aws-lc signature verification, tamper rejection,
+concurrent skill publication, signing outages, and the actual KMS SDK HTTP
+serialization/digest/DER conversion path.
+
+Official Python SDK interoperability passes with independent descriptor-based
+normalization, RFC 8785 canonicalization and cryptography/OpenSSL verification.
+The same verifier accepts the deployed Google Calendar card. A disposable
+production agent verified real KMS signing immediately at creation, after skill
+and metadata changes, and after removing its skill. Owner-key rotation and
+cleanup passed; the test did not invoke a model or calendar.
+
+The read-only deployment checker passed after rollout, including the unchanged
+25,000,000 micro-USD monthly model cap and empty task/dead-letter queues. Both
+Lambda artifact hashes match the reviewed deployment package. The dedicated key
+is enabled P-256 SIGN_VERIFY; IAM simulation allows API signing with ES256 and
+denies signing for the worker. Rotation is implemented/configurable and locally
+tested; a production key replacement was not performed during this rollout.
