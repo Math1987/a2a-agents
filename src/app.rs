@@ -15,6 +15,7 @@ pub struct App {
     pub monthly_budget: u64,
     pub engine_config: crate::engine::EngineConfig,
     pub a2a_auth: Option<Arc<crate::a2a_auth::A2aAuthConfig>>,
+    pub card_signing: Option<Arc<crate::cards::CardSigning>>,
 }
 impl App {
     pub async fn enqueue(&self, agent_id: &str, task_id: &str) -> anyhow::Result<()> {
@@ -51,6 +52,7 @@ impl App {
             monthly_budget: 25_000_000,
             engine_config: Default::default(),
             a2a_auth: None,
+            card_signing: Some(Arc::new(crate::cards::CardSigning::local()?)),
         })
     }
 }

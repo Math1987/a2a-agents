@@ -77,3 +77,20 @@ resource "aws_sqs_queue_redrive_allow_policy" "tasks" {
     sourceQueueArns   = [aws_sqs_queue.tasks.arn]
   })
 }
+
+# Dedicated platform identity; asymmetric signing keys require managed replacement
+# for rotation (KMS automatic rotation applies to symmetric keys).
+resource "aws_kms_key" "cards" {
+  description              = "Aithos A2A Agent Card signing"
+  key_usage                = "SIGN_VERIFY"
+  customer_master_key_spec = "ECC_NIST_P256"
+  deletion_window_in_days  = 30
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_kms_alias" "cards" {
+  name          = "alias/${var.name}-cards"
+  target_key_id = aws_kms_key.cards.key_id
+}

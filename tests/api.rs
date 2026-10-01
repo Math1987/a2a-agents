@@ -1023,3 +1023,460 @@ async fn oauth_disconnect_waits_for_inflight_refresh_before_clearing_rotated_tok
     assert!(persisted.payload.get("sealed").is_none());
     assert!(stores.save(credentials("must-not-reappear")).await.is_err());
 }
+
+fn verify_signed_card(card: &Value, jwks: &Value) -> bool {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
+    let signature = &card["signatures"][0];
+    let protected = signature["protected"].as_str().unwrap();
+    let header: Value = serde_json::from_slice(&B64.decode(protected).unwrap()).unwrap();
+    assert_eq!(header["alg"], "ES256");
+    let key = jwks["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["kid"] == header["kid"])
+        .unwrap();
+    assert!(key.get("d").is_none());
+    let key = jsonwebtoken::DecodingKey::from_ec_components(
+        key["x"].as_str().unwrap(),
+        key["y"].as_str().unwrap(),
+    )
+    .unwrap();
+    let payload = a2a_agents::cards::signing_payload(card).unwrap();
+    let compact = format!(
+        "{protected}.{}.{}",
+        B64.encode(payload),
+        signature["signature"].as_str().unwrap()
+    );
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::ES256);
+    validation.required_spec_claims.clear();
+    validation.validate_exp = false;
+    validation.validate_aud = false;
+    // Independent crypto backend (aws-lc), not the p256 local signer.
+    jsonwebtoken::decode::<Value>(&compact, &key, &validation).is_ok()
+}
+
+#[tokio::test]
+async fn cards_are_signed_at_creation_and_after_each_public_mutation() {
+    let client = Client::new().await;
+    let (id, key) = client.agent("Signed Équipe 🗓").await;
+    let url = format!("/agents/{id}/agent-card.json");
+    let jwks = client
+        .call(Method::GET, "/.well-known/jwks.json", None, None)
+        .await
+        .json;
+    let initial = client.call(Method::GET, &url, None, None).await.json;
+    assert!(verify_signed_card(&initial, &jwks));
+    assert_eq!(initial["skills"], json!([]));
+    assert_eq!(
+        initial["securityRequirements"][0]["schemes"]["owner"],
+        json!({"list":[]})
+    );
+    let again = client.call(Method::GET, &url, None, None).await.json;
+    assert_eq!(initial, again);
+    let alias = client
+        .call(
+            Method::GET,
+            &format!("/agents/{id}/.well-known/agent-card.json"),
+            None,
+            None,
+        )
+        .await
+        .json;
+    assert_eq!(initial, alias);
+    let mut altered = initial.clone();
+    altered["name"] = json!("Impersonated");
+    assert!(!verify_signed_card(&altered, &jwks));
+    assert_eq!(
+        client
+            .call(
+                Method::PATCH,
+                &format!("/v1/agents/{id}"),
+                Some(&key),
+                Some(json!({"name":"Changed", "description":""}))
+            )
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let changed = client.call(Method::GET, &url, None, None).await.json;
+    assert!(verify_signed_card(&changed, &jwks));
+    assert_ne!(changed["signatures"], initial["signatures"]);
+    assert_eq!(changed["description"], "");
+    assert_eq!(
+        client
+            .call(
+                Method::PUT,
+                &format!("/v1/agents/{id}/skills/empty-description"),
+                Some(&key),
+                Some(json!({"name":"Read", "description":"", "instructions":"read only"}))
+            )
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let skilled = client.call(Method::GET, &url, None, None).await.json;
+    assert!(verify_signed_card(&skilled, &jwks));
+    assert_eq!(skilled["skills"][0]["description"], "");
+    assert_eq!(
+        client
+            .call(
+                Method::DELETE,
+                &format!("/v1/agents/{id}/skills/empty-description"),
+                Some(&key),
+                None
+            )
+            .await
+            .status,
+        StatusCode::NO_CONTENT
+    );
+    let removed = client.call(Method::GET, &url, None, None).await.json;
+    assert!(verify_signed_card(&removed, &jwks));
+    assert_eq!(removed["skills"], json!([]));
+}
+
+struct FailedSigner(String);
+#[async_trait::async_trait]
+impl a2a_agents::cards::CardSigner for FailedSigner {
+    fn kid(&self) -> &str {
+        &self.0
+    }
+    async fn sign(&self, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("simulated KMS outage")
+    }
+}
+#[tokio::test]
+async fn signing_outage_preserves_config_and_serves_last_card_without_signing() {
+    use a2a_agents::cards::CardSigning;
+    use std::sync::Arc;
+    let mut client = Client::new().await;
+    let (id, key) = client.agent("Before outage").await;
+    client.skill(&id, &key, "planning").await;
+    let pk = agent_pk(&id);
+    let before = client.app.store.list(&pk, "").await.unwrap();
+    let keys = client.app.card_signing.as_ref().unwrap().jwks()["keys"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let kid = keys[0]["kid"].as_str().unwrap().to_owned();
+    client.app.card_signing = Some(Arc::new(
+        CardSigning::new(Arc::new(FailedSigner(kid)), keys).unwrap(),
+    ));
+    client.router = router(client.app.clone());
+    for (method, path, body) in [
+        (
+            Method::POST,
+            "/v1/agents".into(),
+            Some(json!({"name":"Must fail"})),
+        ),
+        (
+            Method::PATCH,
+            format!("/v1/agents/{id}"),
+            Some(json!({"name":"Must fail"})),
+        ),
+        (
+            Method::PUT,
+            format!("/v1/agents/{id}/skills/new"),
+            Some(json!({"name":"New", "description":"", "instructions":"text"})),
+        ),
+        (
+            Method::DELETE,
+            format!("/v1/agents/{id}/skills/planning"),
+            None,
+        ),
+    ] {
+        assert_eq!(
+            client.call(method, &path, Some(&key), body).await.status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(before).unwrap(),
+        serde_json::to_value(client.app.store.list(&pk, "").await.unwrap()).unwrap()
+    );
+    let card = client
+        .call(
+            Method::GET,
+            &format!("/agents/{id}/agent-card.json"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(card.status, StatusCode::OK);
+    assert_eq!(card.json["name"], "Before outage");
+    assert_eq!(
+        client
+            .call(
+                Method::DELETE,
+                &format!("/v1/agents/{id}"),
+                Some(&key),
+                None
+            )
+            .await
+            .status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        client
+            .call(
+                Method::GET,
+                &format!("/agents/{id}/agent-card.json"),
+                None,
+                None
+            )
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+struct BarrierSigner {
+    key: p256::ecdsa::SigningKey,
+    barrier: tokio::sync::Barrier,
+}
+#[async_trait::async_trait]
+impl a2a_agents::cards::CardSigner for BarrierSigner {
+    fn kid(&self) -> &str {
+        "concurrency-test"
+    }
+    async fn sign(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
+        use p256::ecdsa::signature::Signer;
+        self.barrier.wait().await;
+        let signature: p256::ecdsa::Signature = self.key.sign(input);
+        Ok(signature.to_bytes().to_vec())
+    }
+}
+#[tokio::test]
+async fn concurrent_skill_publications_cannot_overwrite_each_other_or_publish_mixed_state() {
+    use std::sync::Arc;
+    let mut client = Client::new().await;
+    let (id, key) = client.agent("Concurrent").await;
+    let signer = BarrierSigner {
+        key: p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap(),
+        barrier: tokio::sync::Barrier::new(2),
+    };
+    client.app.card_signing = Some(Arc::new(
+        a2a_agents::cards::CardSigning::new(
+            Arc::new(signer),
+            vec![json!({"kid":"concurrency-test"})],
+        )
+        .unwrap(),
+    ));
+    client.router = router(client.app.clone());
+    let (a, b) = tokio::join!(client.skill(&id, &key, "a"), client.skill(&id, &key, "b"));
+    assert!(
+        (a.status == StatusCode::OK && b.status == StatusCode::CONFLICT)
+            || (b.status == StatusCode::OK && a.status == StatusCode::CONFLICT)
+    );
+    let card = client
+        .call(
+            Method::GET,
+            &format!("/agents/{id}/agent-card.json"),
+            None,
+            None,
+        )
+        .await
+        .json;
+    let skills = client
+        .call(
+            Method::GET,
+            &format!("/v1/agents/{id}/skills"),
+            Some(&key),
+            None,
+        )
+        .await
+        .json;
+    assert_eq!(card["skills"].as_array().unwrap().len(), 1);
+    assert_eq!(card["skills"][0]["id"], skills["skills"][0]["id"]);
+}
+
+#[tokio::test]
+async fn backfill_and_rotation_keep_existing_keys_verifiable() {
+    use std::sync::Arc;
+    let mut client = Client::new().await;
+    let (id, _) = client.agent("Rotation").await;
+    let old = client
+        .app
+        .store
+        .get(&agent_pk(&id), "CARD")
+        .await
+        .unwrap()
+        .unwrap()
+        .payload;
+    let old_keys = client.app.card_signing.as_ref().unwrap().jwks();
+    client.app.card_signing = Some(Arc::new(a2a_agents::cards::CardSigning::local().unwrap()));
+    a2a_agents::api::republish_existing_card(&client.app, &id)
+        .await
+        .unwrap();
+    let new = client
+        .app
+        .store
+        .get(&agent_pk(&id), "CARD")
+        .await
+        .unwrap()
+        .unwrap()
+        .payload;
+    assert!(verify_signed_card(&old, &old_keys));
+    assert!(verify_signed_card(
+        &new,
+        &client.app.card_signing.as_ref().unwrap().jwks()
+    ));
+    assert_ne!(old["signatures"], new["signatures"]);
+    assert_eq!(old["skills"], new["skills"]);
+    assert!(
+        !a2a_agents::api::republish_existing_card(&client.app, "missing")
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn control_proof_requires_owner_binds_exact_bytes_and_is_revoked_by_rotation() {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
+    use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+    use sha2::{Digest, Sha256};
+    let client = Client::new().await;
+    let (id, key) = client.agent("Proof agent").await;
+    let (_, other) = client.agent("Other").await;
+    let path = format!("/v1/agents/{id}/control-proofs");
+    let input = json!({"registryAgentId":"a".repeat(43),"domain":"mathieucolla.com",
+        "nonce":"b".repeat(43),"audience":"https://registry.aithos.world"});
+    for key in [None, Some(other.as_str())] {
+        assert_eq!(
+            client
+                .call(Method::POST, &path, key, Some(input.clone()))
+                .await
+                .status,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let mut invalid = input.clone();
+    invalid["audience"] = json!("https://evil.example");
+    assert_eq!(
+        client
+            .call(Method::POST, &path, Some(&key), Some(invalid))
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+    let result = client
+        .call(Method::POST, &path, Some(&key), Some(input))
+        .await;
+    assert_eq!(result.status, StatusCode::OK, "{}", result.json);
+    let receipt = result.json["receipt"].as_str().unwrap();
+    assert!(!receipt.contains(&key));
+    let parts: Vec<_> = receipt.split('.').collect();
+    let header: Value = serde_json::from_slice(&B64.decode(parts[0]).unwrap()).unwrap();
+    let claims: Value = serde_json::from_slice(&B64.decode(parts[1]).unwrap()).unwrap();
+    assert_eq!(header["typ"], "aithos-host-control+jwt");
+    assert_eq!(claims["hostedAgentId"], id);
+    assert_eq!(claims["domain"], "mathieucolla.com");
+    assert_eq!(
+        claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap(),
+        600
+    );
+    let jwks = client.app.card_signing.as_ref().unwrap().jwks();
+    let jwk = &jwks["keys"][0];
+    let mut point = vec![4];
+    point.extend(B64.decode(jwk["x"].as_str().unwrap()).unwrap());
+    point.extend(B64.decode(jwk["y"].as_str().unwrap()).unwrap());
+    VerifyingKey::from_sec1_bytes(&point)
+        .unwrap()
+        .verify(
+            format!("{}.{}", parts[0], parts[1]).as_bytes(),
+            &Signature::from_slice(&B64.decode(parts[2]).unwrap()).unwrap(),
+        )
+        .unwrap();
+    let response = client
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/agents/{id}/agent-card.json"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        claims["cardDigest"],
+        format!("sha256:{:x}", Sha256::digest(bytes))
+    );
+    let status_url = result.json["statusUrl"]
+        .as_str()
+        .unwrap()
+        .strip_prefix(&client.app.public_url)
+        .unwrap();
+    assert_eq!(
+        client.call(Method::GET, status_url, None, None).await.json["active"],
+        true
+    );
+    assert_eq!(
+        client
+            .call(
+                Method::POST,
+                &format!("/v1/agents/{id}/key"),
+                Some(&key),
+                None
+            )
+            .await
+            .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        client.call(Method::GET, status_url, None, None).await.json["active"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn control_proof_never_escapes_if_management_changes_during_signing() {
+    use a2a_agents::{
+        cards::{CardSigner, CardSigning},
+        store::Store,
+    };
+    use std::sync::Arc;
+    struct RacingSigner {
+        store: Arc<dyn Store>,
+        id: String,
+    }
+    #[async_trait::async_trait]
+    impl CardSigner for RacingSigner {
+        fn kid(&self) -> &str {
+            "race"
+        }
+        async fn sign(&self, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let mut row = self.store.get(&agent_pk(&self.id), "META").await?.unwrap();
+            let version = row.version;
+            row.payload["deleted"] = json!(true);
+            assert!(self.store.put(row, Some(version)).await?);
+            Ok(vec![1; 64])
+        }
+    }
+    let mut client = Client::new().await;
+    let (id, key) = client.agent("Race").await;
+    client.app.card_signing = Some(Arc::new(
+        CardSigning::new(
+            Arc::new(RacingSigner {
+                store: client.app.store.clone(),
+                id: id.clone(),
+            }),
+            vec![json!({"kid":"race"})],
+        )
+        .unwrap(),
+    ));
+    client.router = router(client.app.clone());
+    let reply=client.call(Method::POST,&format!("/v1/agents/{id}/control-proofs"),Some(&key),Some(json!({"registryAgentId":"a".repeat(43),"domain":"mathieucolla.com","nonce":"b".repeat(43),"audience":"https://registry.aithos.world"}))).await;
+    assert_eq!(reply.status, StatusCode::CONFLICT);
+    assert!(reply.json.get("receipt").is_none());
+    assert!(
+        client
+            .app
+            .store
+            .list(&agent_pk(&id), "CONTROL#")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

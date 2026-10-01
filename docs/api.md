@@ -151,3 +151,27 @@ For completed tasks, `result.usage` contains aggregate `input_tokens` and `outpu
 | `/oauth/callback/{agent}/{connection}` | GET | Valid one-time OAuth state |
 | `/v1/agents/{agent}/tasks` | GET, POST | Owner |
 | `/v1/agents/{agent}/tasks/{task}` | GET | Owner |
+
+## Experimental hosting control receipts
+
+`POST /v1/agents/{id}/control-proofs` requires the agent's owner bearer key.
+It accepts `registryAgentId` (RFC7638 thumbprint), `domain` (canonical lowercase
+DNS name), `nonce` (32 random bytes encoded as unpadded base64url), and
+`audience` (`https://registry.aithos.world` or the development origin
+`https://registry-dev.aithos.world`). Invocation JWTs cannot use it.
+
+The response contains `receipt`, a compact ES256 JWS with type
+`aithos-host-control+jwt`, and `statusUrl`. Verifiers obtain keys from the fixed
+hosting `/.well-known/jwks.json` endpoint; they must never follow a key URL from
+an untrusted receipt. The signed claims bind the hosting ID, registry identity,
+domain, nonce, audience, exact served card URL and SHA256 bytes, management
+revision, receipt ID and a ten-minute validity window.
+
+A conditional transaction stores the receipt and advances the management
+revision. Concurrent card edits, deletion or owner-key rotation abort issuance.
+A new receipt also supersedes preceding receipts. Public `GET` on `statusUrl`
+returns the original receipt and an `active` boolean, with `Cache-Control:
+no-store`. It becomes inactive on expiry or any management revision change.
+Rows are eligible for TTL cleanup after one day; TTL is not the expiry check.
+A receipt attests to management-credential control at issuance, not legal
+ownership, DNS control, agent safety or permission to execute its tools.

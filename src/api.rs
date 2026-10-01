@@ -16,6 +16,7 @@ use rmcp::transport::auth::{CredentialStore, StateStore};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+#[derive(Debug)]
 pub struct ApiError(StatusCode, &'static str);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -57,9 +58,12 @@ pub fn router(app: App) -> Router {
     Router::new().route("/health",get(||async{Json(json!({"status":"ok","service":"a2a-agents"}))}))
       .route("/openapi.json",get(||async{([("content-type","application/json")],include_str!("../docs/openapi.json"))}))
       .route("/",get(||async{Json(json!({"service":"Aithos Agents","version":"0.2.0","docs":"https://github.com/Math1987/a2a-agents","phase":2}))}))
+      .route("/.well-known/jwks.json",get(jwks))
       .route("/v1/agents",post(create_agent))
       .route("/v1/agents/{agent}",get(get_agent).patch(update_agent).delete(delete_agent))
       .route("/v1/agents/{agent}/key",post(rotate_key))
+      .route("/v1/agents/{agent}/control-proofs",post(control_proof))
+      .route("/v1/agents/{agent}/control-proofs/{proof}",get(control_proof_status))
       .route("/agents/{agent}/agent-card.json",get(card))
       .route("/agents/{agent}/.well-known/agent-card.json",get(card))
       .route("/v1/agents/{agent}/skills",get(list_skills))
@@ -126,16 +130,15 @@ async fn create_agent(
         created_at: now(),
         deleted: false,
     };
-    if !app
-        .store
-        .put(
-            Row::new(agent_pk(&id), "META", serde_json::to_value(&a)?),
-            None,
-        )
-        .await?
-    {
-        return Err(conflict());
-    }
+    publish_card(
+        &app,
+        Row::new(agent_pk(&id), "META", serde_json::to_value(&a)?),
+        None,
+        &a,
+        vec![],
+        vec![],
+    )
+    .await?;
     let mut response = agent_public(&a, &app.public_url);
     response["owner_key"] = json!(secret);
     Ok((StatusCode::CREATED, Json(response)))
@@ -147,6 +150,119 @@ async fn get_agent(
 ) -> Result<Json<Value>, ApiError> {
     let (_, a) = owner(&app, &id, &h).await?;
     Ok(Json(agent_public(&a, &app.public_url)))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ControlProofInput {
+    registry_agent_id: String,
+    domain: String,
+    nonce: String,
+    audience: String,
+}
+
+async fn control_proof(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    h: HeaderMap,
+    Json(input): Json<ControlProofInput>,
+) -> Result<Json<Value>, ApiError> {
+    let (meta, _) = owner(&app, &id, &h).await?;
+    let token = |s: &str| {
+        s.len() == 43
+            && s.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+    };
+    let domain = &input.domain;
+    if !token(&input.registry_agent_id)
+        || !token(&input.nonce)
+        || ![
+            "https://registry.aithos.world",
+            "https://registry-dev.aithos.world",
+        ]
+        .contains(&input.audience.as_str())
+        || domain.len() > 253
+        || !domain.contains('.')
+        || domain.split('.').any(|l| {
+            l.is_empty()
+                || l.len() > 63
+                || l.starts_with('-')
+                || l.ends_with('-')
+                || !l
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        })
+    {
+        return Err(invalid());
+    }
+    let card = app
+        .store
+        .get(&agent_pk(&id), "CARD")
+        .await?
+        .filter(|r| !r.payload.is_null())
+        .ok_or_else(missing)?;
+    // Exactly the bytes Axum's Json<Value> serves, including A2A signatures.
+    use sha2::{Digest, Sha256};
+    let card_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&card.payload)?)
+    );
+    let issued = chrono::Utc::now().timestamp();
+    let proof_id = uuid::Uuid::new_v4().to_string();
+    let version = meta.version;
+    let claims = json!({"iss":app.public_url,"aud":input.audience,"jti":proof_id,
+        "iat":issued,"exp":issued + 600,"nonce":input.nonce,"hostedAgentId":id,
+        "registryAgentId":input.registry_agent_id,"domain":input.domain,
+        "cardUrl":format!("{}/agents/{id}/agent-card.json",app.public_url),
+        "cardDigest":card_digest,"managementRevision":version + 1});
+    let receipt = app
+        .card_signing
+        .as_ref()
+        .ok_or(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "card_signing_unavailable",
+        ))?
+        .sign_control_proof(&claims)
+        .await?;
+    let mut proof = Row::new(
+        agent_pk(&id),
+        format!("CONTROL#{proof_id}"),
+        json!({"claims":claims,"receipt":receipt}),
+    );
+    proof.expires_at = Some(issued + 86400);
+    // A receipt is released only after fencing owner rotation, deletion and
+    // card changes. A newer proof conservatively supersedes an older one.
+    if !app
+        .store
+        .transaction(vec![(meta, Some(version)), (proof, None)])
+        .await?
+    {
+        return Err(conflict());
+    }
+    Ok(Json(
+        json!({"receipt":receipt,"statusUrl":format!("{}/v1/agents/{id}/control-proofs/{proof_id}",app.public_url)}),
+    ))
+}
+
+async fn control_proof_status(
+    State(app): State<App>,
+    Path((id, proof)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let row = app
+        .store
+        .get(&agent_pk(&id), &format!("CONTROL#{proof}"))
+        .await?
+        .ok_or_else(missing)?;
+    let meta = app.store.get(&agent_pk(&id), "META").await?;
+    let claims = &row.payload["claims"];
+    let active = meta.is_some_and(|m| {
+        m.payload["deleted"] == false && Some(m.version) == claims["managementRevision"].as_u64()
+    }) && claims["exp"]
+        .as_i64()
+        .is_some_and(|t| chrono::Utc::now().timestamp() < t);
+    Ok(Json(
+        json!({"active":active,"receipt":row.payload["receipt"]}),
+    ))
 }
 async fn update_agent(
     State(app): State<App>,
@@ -162,9 +278,8 @@ async fn update_agent(
     a.description = input.description;
     let v = row.version;
     row.payload = serde_json::to_value(&a)?;
-    if !app.store.put(row, Some(v)).await? {
-        return Err(conflict());
-    }
+    let sk = skills(&app, &id).await?;
+    publish_card(&app, row, Some(v), &a, sk, vec![]).await?;
     Ok(Json(agent_public(&a, &app.public_url)))
 }
 async fn rotate_key(
@@ -230,7 +345,7 @@ async fn save_skill(
     h: HeaderMap,
     Json(mut input): Json<Skill>,
 ) -> Result<Json<Skill>, ApiError> {
-    owner(&app, &id, &h).await?;
+    let (meta, a) = owner(&app, &id, &h).await?;
     if skill.len() > 100
         || input.name.trim().is_empty()
         || input.instructions.is_empty()
@@ -246,16 +361,22 @@ async fn save_skill(
     }
     let key = format!("SKILL#{skill}");
     let old = app.store.get(&agent_pk(&id), &key).await?;
-    if !app
-        .store
-        .put(
+    let mut sk = skills(&app, &id).await?;
+    sk.retain(|s| s.id != skill);
+    sk.push(input.clone());
+    let v = meta.version;
+    publish_card(
+        &app,
+        meta,
+        Some(v),
+        &a,
+        sk,
+        vec![(
             Row::new(agent_pk(&id), key, serde_json::to_value(&input)?),
             old.map(|r| r.version),
-        )
-        .await?
-    {
-        return Err(conflict());
-    }
+        )],
+    )
+    .await?;
     Ok(Json(input))
 }
 async fn remove_skill(
@@ -263,7 +384,7 @@ async fn remove_skill(
     Path((id, skill)): Path<(String, String)>,
     h: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    owner(&app, &id, &h).await?;
+    let (meta, a) = owner(&app, &id, &h).await?;
     let mut row = app
         .store
         .get(&agent_pk(&id), &format!("SKILL#{skill}"))
@@ -271,13 +392,90 @@ async fn remove_skill(
         .ok_or_else(missing)?;
     let v = row.version;
     row.payload = Value::Null;
-    if !app.store.put(row, Some(v)).await? {
-        return Err(conflict());
-    }
+    let mut sk = skills(&app, &id).await?;
+    sk.retain(|s| s.id != skill);
+    let mv = meta.version;
+    publish_card(&app, meta, Some(mv), &a, sk, vec![(row, Some(v))]).await?;
     Ok(StatusCode::NO_CONTENT)
 }
+async fn jwks(State(app): State<App>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        app.card_signing
+            .as_ref()
+            .ok_or(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "card_signing_unavailable",
+            ))?
+            .jwks(),
+    ))
+}
 async fn card(State(app): State<App>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
-    let card = agent_card(&app, &id).await?;
+    agent(&app, &id).await?;
+    let row = app
+        .store
+        .get(&agent_pk(&id), "CARD")
+        .await?
+        .filter(|r| !r.payload.is_null())
+        .ok_or(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "card_publication_pending",
+        ))?;
+    Ok(Json(row.payload))
+}
+
+/// META is the common concurrency fence for ALL public configuration writes.
+/// Read it before skills; changing any skill increments META in the same
+/// transaction as the snapshot. Mixed reads therefore cannot commit.
+async fn publish_card(
+    app: &App,
+    meta: Row,
+    expected: Option<u64>,
+    a: &Agent,
+    mut sk: Vec<Skill>,
+    mut changes: Vec<(Row, Option<u64>)>,
+) -> Result<(), ApiError> {
+    sk.sort_by(|a, b| a.id.cmp(&b.id));
+    let old = app.store.get(&agent_pk(&a.id), "CARD").await?;
+    let value = card_value(build_agent_card(app, a.clone(), sk))?;
+    let signing = app.card_signing.as_ref().ok_or(ApiError(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "card_signing_unavailable",
+    ))?;
+    let signed = signing.sign_card(value, &app.public_url).await?;
+    changes.push((meta, expected));
+    changes.push((
+        Row::new(agent_pk(&a.id), "CARD", signed),
+        old.map(|r| r.version),
+    ));
+    if !app.store.transaction(changes).await? {
+        return Err(conflict());
+    }
+    Ok(())
+}
+
+/// Operator backfill/rotation; no public signing oracle and no owner secret needed.
+/// Runs with operator AWS permissions, never through unauthenticated HTTP.
+pub async fn republish_card(app: &App, id: &str) -> Result<(), ApiError> {
+    let (meta, a) = agent(app, id).await?;
+    let expected = meta.version;
+    let sk = skills(app, id).await?;
+    publish_card(app, meta, Some(expected), &a, sk, vec![]).await
+}
+
+/// Safe to rerun after concurrent changes; deleted agents remain unpublished.
+pub async fn republish_existing_card(app: &App, id: &str) -> Result<bool, ApiError> {
+    for _ in 0..3 {
+        match republish_card(app, id).await {
+            Ok(()) => return Ok(true),
+            Err(ApiError(StatusCode::NOT_FOUND, _)) => return Ok(false),
+            Err(ApiError(StatusCode::CONFLICT, _)) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(conflict())
+}
+
+fn card_value(card: a2a_protocol::AgentCard) -> Result<Value, ApiError> {
     let mut value = a2a_pb::protojson_conv::to_value(&card)
         .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "invalid_agent_card"))?;
     // Keep the existing public card contract explicit even when ProtoJSON
@@ -306,15 +504,23 @@ async fn card(State(app): State<App>, Path(id): Path<String>) -> Result<Json<Val
             }
         }
     }
-    Ok(Json(value))
+    // ProtoJSON also omits empty required skill descriptions.
+    for (value, skill) in value["skills"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+        .zip(&card.skills)
+    {
+        value["description"] = json!(skill.description);
+    }
+    Ok(value)
 }
-pub(crate) async fn agent_card(app: &App, id: &str) -> Result<a2a_protocol::AgentCard, ApiError> {
+fn build_agent_card(app: &App, a: Agent, sk: Vec<Skill>) -> a2a_protocol::AgentCard {
     use a2a_protocol::{
         AgentCapabilities, AgentCard, AgentInterface, AgentSkill, HttpAuthSecurityScheme,
         SecurityScheme,
     };
-    let (_, a) = agent(app, id).await?;
-    let sk = skills(app, id).await?;
+    let id = &a.id;
     let mut schemes = std::collections::HashMap::from([(
         "owner".into(),
         SecurityScheme::HttpAuth(HttpAuthSecurityScheme {
@@ -330,7 +536,7 @@ pub(crate) async fn agent_card(app: &App, id: &str) -> Result<a2a_protocol::Agen
         }));
         requirements.push(std::collections::HashMap::from([("aithos".into(), vec![])]));
     }
-    Ok(AgentCard {
+    AgentCard {
         name: a.name,
         description: a.description,
         version: "0.2.0".into(),
@@ -367,7 +573,7 @@ pub(crate) async fn agent_card(app: &App, id: &str) -> Result<a2a_protocol::Agen
         security_schemes: Some(schemes),
         security_requirements: Some(requirements),
         signatures: None,
-    })
+    }
 }
 pub async fn connection(app: &App, agent: &str, id: &str) -> Result<(Row, Connection), ApiError> {
     let row = app

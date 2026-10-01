@@ -77,3 +77,27 @@ variable "extra_environment" {
   type        = map(string)
   default     = {}
 }
+
+variable "card_signing_key_arn" {
+  description = "Optional immutable P-256 SIGN_VERIFY key ARN for managed rotation; defaults to this stack's dedicated key. Never use an alias."
+  type        = string
+  default     = null
+  validation {
+    condition     = var.card_signing_key_arn == null || can(regex("^arn:[^:]+:kms:[^:]+:[0-9]+:key/", var.card_signing_key_arn))
+    error_message = "Use an immutable KMS key ARN."
+  }
+}
+
+variable "card_retained_key_arns" {
+  description = "Public verification keys kept during rotation; include the next key here before activating it."
+  type        = list(string)
+  default     = []
+  validation {
+    condition     = alltrue([for arn in var.card_retained_key_arns : can(regex("^arn:[^:]+:kms:[^:]+:[0-9]+:key/", arn))])
+    error_message = "Use immutable KMS key ARNs."
+  }
+}
+
+locals {
+  card_signing_key_arn = coalesce(var.card_signing_key_arn, aws_kms_key.cards.arn)
+}
