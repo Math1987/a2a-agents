@@ -62,6 +62,8 @@ pub fn router(app: App) -> Router {
       .route("/v1/agents",post(create_agent))
       .route("/v1/agents/{agent}",get(get_agent).patch(update_agent).delete(delete_agent))
       .route("/v1/agents/{agent}/key",post(rotate_key))
+      .route("/v1/agents/{agent}/control-proofs",post(control_proof))
+      .route("/v1/agents/{agent}/control-proofs/{proof}",get(control_proof_status))
       .route("/agents/{agent}/agent-card.json",get(card))
       .route("/agents/{agent}/.well-known/agent-card.json",get(card))
       .route("/v1/agents/{agent}/skills",get(list_skills))
@@ -148,6 +150,119 @@ async fn get_agent(
 ) -> Result<Json<Value>, ApiError> {
     let (_, a) = owner(&app, &id, &h).await?;
     Ok(Json(agent_public(&a, &app.public_url)))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ControlProofInput {
+    registry_agent_id: String,
+    domain: String,
+    nonce: String,
+    audience: String,
+}
+
+async fn control_proof(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    h: HeaderMap,
+    Json(input): Json<ControlProofInput>,
+) -> Result<Json<Value>, ApiError> {
+    let (meta, _) = owner(&app, &id, &h).await?;
+    let token = |s: &str| {
+        s.len() == 43
+            && s.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+    };
+    let domain = &input.domain;
+    if !token(&input.registry_agent_id)
+        || !token(&input.nonce)
+        || ![
+            "https://registry.aithos.world",
+            "https://registry-dev.aithos.world",
+        ]
+        .contains(&input.audience.as_str())
+        || domain.len() > 253
+        || !domain.contains('.')
+        || domain.split('.').any(|l| {
+            l.is_empty()
+                || l.len() > 63
+                || l.starts_with('-')
+                || l.ends_with('-')
+                || !l
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        })
+    {
+        return Err(invalid());
+    }
+    let card = app
+        .store
+        .get(&agent_pk(&id), "CARD")
+        .await?
+        .filter(|r| !r.payload.is_null())
+        .ok_or_else(missing)?;
+    // Exactly the bytes Axum's Json<Value> serves, including A2A signatures.
+    use sha2::{Digest, Sha256};
+    let card_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&card.payload)?)
+    );
+    let issued = chrono::Utc::now().timestamp();
+    let proof_id = uuid::Uuid::new_v4().to_string();
+    let version = meta.version;
+    let claims = json!({"iss":app.public_url,"aud":input.audience,"jti":proof_id,
+        "iat":issued,"exp":issued + 600,"nonce":input.nonce,"hostedAgentId":id,
+        "registryAgentId":input.registry_agent_id,"domain":input.domain,
+        "cardUrl":format!("{}/agents/{id}/agent-card.json",app.public_url),
+        "cardDigest":card_digest,"managementRevision":version + 1});
+    let receipt = app
+        .card_signing
+        .as_ref()
+        .ok_or(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "card_signing_unavailable",
+        ))?
+        .sign_control_proof(&claims)
+        .await?;
+    let mut proof = Row::new(
+        agent_pk(&id),
+        format!("CONTROL#{proof_id}"),
+        json!({"claims":claims,"receipt":receipt}),
+    );
+    proof.expires_at = Some(issued + 86400);
+    // A receipt is released only after fencing owner rotation, deletion and
+    // card changes. A newer proof conservatively supersedes an older one.
+    if !app
+        .store
+        .transaction(vec![(meta, Some(version)), (proof, None)])
+        .await?
+    {
+        return Err(conflict());
+    }
+    Ok(Json(
+        json!({"receipt":receipt,"statusUrl":format!("{}/v1/agents/{id}/control-proofs/{proof_id}",app.public_url)}),
+    ))
+}
+
+async fn control_proof_status(
+    State(app): State<App>,
+    Path((id, proof)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let row = app
+        .store
+        .get(&agent_pk(&id), &format!("CONTROL#{proof}"))
+        .await?
+        .ok_or_else(missing)?;
+    let meta = app.store.get(&agent_pk(&id), "META").await?;
+    let claims = &row.payload["claims"];
+    let active = meta.is_some_and(|m| {
+        m.payload["deleted"] == false && Some(m.version) == claims["managementRevision"].as_u64()
+    }) && claims["exp"]
+        .as_i64()
+        .is_some_and(|t| chrono::Utc::now().timestamp() < t);
+    Ok(Json(
+        json!({"active":active,"receipt":row.payload["receipt"]}),
+    ))
 }
 async fn update_agent(
     State(app): State<App>,

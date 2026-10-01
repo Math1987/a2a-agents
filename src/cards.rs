@@ -37,6 +37,17 @@ impl CardSigning {
     pub fn jwks(&self) -> Value {
         self.jwks.clone()
     }
+    /// A distinct JWS type prevents these receipts from being accepted as cards.
+    pub async fn sign_control_proof(&self, claims: &Value) -> anyhow::Result<String> {
+        let protected = B64.encode(serde_json::to_vec(&json!({
+            "alg":"ES256", "typ":"aithos-host-control+jwt", "kid":self.signer.kid()
+        }))?);
+        let payload = B64.encode(serde_json::to_vec(claims)?);
+        let input = format!("{protected}.{payload}");
+        let signature = self.signer.sign(input.as_bytes()).await?;
+        ensure!(signature.len() == 64, "invalid ES256 signature length");
+        Ok(format!("{input}.{}", B64.encode(signature)))
+    }
     pub fn local() -> anyhow::Result<Self> {
         let mut bytes = [0u8; 32];
         getrandom::fill(&mut bytes).map_err(|_| anyhow::anyhow!("signing entropy unavailable"))?;
